@@ -2,7 +2,7 @@ generator client {
   provider = "prisma-client-js"
 }
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
 }
 
 model PriceHistory {
@@ -157,6 +157,34 @@ model Relayer {
   allowedAssets String
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
+}
+
+// OHLC Candle Model – Issue #208: Analytics | Time-Series Data Aggregation Service
+// Stores Open/High/Low/Close aggregates produced by the PriceAggregator worker.
+// Granularity is one of "MINUTE" | "HOUR" | "DAY".
+model OhlcCandle {
+  id          Int      @id @default(autoincrement())
+  currency    String   // e.g., "NGN", "KES", "GHS"
+  granularity String   // "MINUTE" | "HOUR" | "DAY"
+  openTime    DateTime // Start of the candle window (UTC, truncated to granularity)
+  closeTime   DateTime // End of the candle window (exclusive)
+
+  open        Decimal  // First price in the window
+  high        Decimal  // Highest price in the window
+  low         Decimal  // Lowest price in the window
+  close       Decimal  // Last price in the window
+  count       Int      @default(0) // Number of raw ticks aggregated
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Composite unique – one candle per (currency, granularity, openTime)
+  @@unique([currency, granularity, openTime])
+
+  // Primary query pattern: fetch candles for a currency/granularity over a time range
+  @@index([currency, granularity, openTime])
+  // Secondary: sweep all candles in a time range (e.g. backfill checks)
+  @@index([granularity, openTime])
 }
 
 // Hourly Statistics for smoothing out price spikes

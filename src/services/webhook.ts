@@ -29,18 +29,18 @@ type DiscordPayload = {
 type SlackPayload = {
   blocks: Array<
     | {
-      type: "header";
-      text: PlainText;
-    }
+        type: "header";
+        text: PlainText;
+      }
     | {
-      type: "section";
-      fields?: MarkdownText[];
-      text?: MarkdownText;
-    }
+        type: "section";
+        fields?: MarkdownText[];
+        text?: MarkdownText;
+      }
     | {
-      type: "context";
-      elements: MarkdownText[];
-    }
+        type: "context";
+        elements: MarkdownText[];
+      }
   >;
 };
 
@@ -307,7 +307,8 @@ export class WebhookService {
   private formatGasBalanceAlert(
     alertDetails: GasBalanceAlertDetails,
   ): WebhookPayload {
-    const { currentBalance, threshold, walletAddress, timestamp } = alertDetails;
+    const { currentBalance, threshold, walletAddress, timestamp } =
+      alertDetails;
     const deficit = (threshold - currentBalance).toFixed(2);
 
     if (this.platform === "discord") {
@@ -333,11 +334,17 @@ export class WebhookService {
                 inline: true,
               },
               ...(walletAddress
-                ? [{ name: "Wallet Address", value: `${walletAddress.substring(0, 20)}...` }]
+                ? [
+                    {
+                      name: "Wallet Address",
+                      value: `${walletAddress.substring(0, 20)}...`,
+                    },
+                  ]
                 : []),
               {
                 name: "Action Required",
-                value: "Top up the admin wallet with XLM to ensure transaction fees can be paid",
+                value:
+                  "Top up the admin wallet with XLM to ensure transaction fees can be paid",
               },
               { name: "Time", value: timestamp.toISOString() },
             ],
@@ -350,16 +357,27 @@ export class WebhookService {
       blocks: [
         {
           type: "header",
-          text: { type: "plain_text", text: "🚨 CRITICAL: Low Gas Balance Alert" },
+          text: {
+            type: "plain_text",
+            text: "🚨 CRITICAL: Low Gas Balance Alert",
+          },
         },
         {
           type: "section",
           fields: [
-            { type: "mrkdwn", text: `*Current Balance:*\n${currentBalance.toFixed(2)} XLM` },
+            {
+              type: "mrkdwn",
+              text: `*Current Balance:*\n${currentBalance.toFixed(2)} XLM`,
+            },
             { type: "mrkdwn", text: `*Alert Threshold:*\n${threshold} XLM` },
             { type: "mrkdwn", text: `*Deficit:*\n${deficit} XLM` },
             ...(walletAddress
-              ? [{ type: "mrkdwn" as const, text: `*Wallet Address:*\n${walletAddress.substring(0, 20)}...` }]
+              ? [
+                  {
+                    type: "mrkdwn" as const,
+                    text: `*Wallet Address:*\n${walletAddress.substring(0, 20)}...`,
+                  },
+                ]
               : []),
           ],
         },
@@ -372,7 +390,9 @@ export class WebhookService {
         },
         {
           type: "context",
-          elements: [{ type: "mrkdwn", text: `Detected at ${timestamp.toISOString()}` }],
+          elements: [
+            { type: "mrkdwn", text: `Detected at ${timestamp.toISOString()}` },
+          ],
         },
       ],
     };
@@ -384,7 +404,9 @@ export class WebhookService {
   ): WebhookPayload {
     const { consecutiveFailures, lastKnownBalance, timestamp } = alertDetails;
     const lastBalance =
-      lastKnownBalance !== null ? `${lastKnownBalance.toFixed(2)} XLM` : "Unknown";
+      lastKnownBalance !== null
+        ? `${lastKnownBalance.toFixed(2)} XLM`
+        : "Unknown";
 
     if (this.platform === "discord") {
       return {
@@ -405,11 +427,13 @@ export class WebhookService {
               },
               {
                 name: "Issue",
-                value: "Unable to check admin wallet balance. Cannot confirm if funds are sufficient.",
+                value:
+                  "Unable to check admin wallet balance. Cannot confirm if funds are sufficient.",
               },
               {
                 name: "Action Required",
-                value: "Investigate Stellar Horizon connectivity and verify environment variables.",
+                value:
+                  "Investigate Stellar Horizon connectivity and verify environment variables.",
               },
               { name: "Time", value: timestamp.toISOString() },
             ],
@@ -422,12 +446,18 @@ export class WebhookService {
       blocks: [
         {
           type: "header",
-          text: { type: "plain_text", text: "🚨 CRITICAL: Gas Monitor Failures" },
+          text: {
+            type: "plain_text",
+            text: "🚨 CRITICAL: Gas Monitor Failures",
+          },
         },
         {
           type: "section",
           fields: [
-            { type: "mrkdwn", text: `*Consecutive Failures:*\n${consecutiveFailures}` },
+            {
+              type: "mrkdwn",
+              text: `*Consecutive Failures:*\n${consecutiveFailures}`,
+            },
             { type: "mrkdwn", text: `*Last Known Balance:*\n${lastBalance}` },
           ],
         },
@@ -447,7 +477,9 @@ export class WebhookService {
         },
         {
           type: "context",
-          elements: [{ type: "mrkdwn", text: `Detected at ${timestamp.toISOString()}` }],
+          elements: [
+            { type: "mrkdwn", text: `Detected at ${timestamp.toISOString()}` },
+          ],
         },
       ],
     };
@@ -464,3 +496,5 @@ export function getWebhookService(): WebhookService {
   }
   return _instance;
 }
+
+export const webhookService = getWebhookService();
