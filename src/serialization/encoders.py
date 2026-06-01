@@ -1,34 +1,72 @@
-import orjson
-from typing import Any, Dict, List, Union
+from __future__ import annotations
 
-# Types that are commonly used in the project for telemetry or internal messages.
-JSONType = Union[Dict[str, Any], List[Any], str, int, float, bool, None]
+import struct
+from typing import NamedTuple
 
-def encode_to_bytes(data: JSONType) -> bytes:
-    """Encode *data* to a compact JSON ``bytes`` representation using ``orjson``.
+# Binary format for a telemetry payload frame.
+# Fields (all little-endian, unaligned):
+#   asset_id  : 8s  — 8-byte ASCII asset identifier (e.g. b"NGN/XLM\x00")
+#   price     : q   — int64 scaled price (10^7 fixed-point)
+#   timestamp : Q   — uint64 Unix timestamp in milliseconds
+#   sequence  : I   — uint32 sequence / nonce counter
+#   flags     : H   — uint16 status flags bitmask
+#
+# Total frame size: 8 + 8 + 8 + 4 + 2 = 30 bytes (unaligned, no padding)
+_FRAME_FMT = "<8sqQIH"
+_FRAME_SIZE = struct.calcsize(_FRAME_FMT)  # 30 bytes
 
-    - ``orjson`` produces the smallest possible UTF‑8 JSON output and is
-      significantly faster than the standard ``json`` module.
-    - ``orjson.dumps`` returns ``bytes`` directly, which is ideal for
-      transmission over message queues or sockets.
-    - ``option=orjson.OPT_UTC_Z"`` ensures all ``datetime`` objects are
-      serialized as ISO‑8601 UTC strings.
+
+class TelemetryFrame(NamedTuple):
+    asset_id: bytes   # exactly 8 bytes
+    price: int        # int64 — scaled to 10^7
+    timestamp: int    # uint64 — milliseconds since epoch
+    sequence: int     # uint32
+    flags: int        # uint16
+
+
+def pack_frame(frame: TelemetryFrame) -> bytes:
+    """Pack a :class:`TelemetryFrame` into a compact 30-byte binary buffer.
+
+    Uses ``struct.pack`` with a little-endian, unaligned format so the output
+    is the smallest possible raw byte array with no JSON overhead.
     """
-    # ``orjson`` automatically handles most built‑in Python types.
-    # For objects that ``orjson`` cannot serialize, callers should convert them
-    # to a serializable form (e.g., via ``.dict()`` or ``.isoformat()``) before
-    # invoking this function.
-    return orjson.dumps(data, option=orjson.OPT_UTC_Z)
+    asset_bytes = frame.asset_id[:8].ljust(8, b"\x00")
+    return struct.pack(_FRAME_FMT, asset_bytes, frame.price, frame.timestamp, frame.sequence, frame.flags)
 
-def encode_to_str(data: JSONType) -> str:
-    """Encode *data* to a JSON string using ``orjson``.
 
-    This is a thin wrapper around :func:`encode_to_bytes` for callers that
-    prefer a ``str`` rather than ``bytes``.
-    """
-    return encode_to_bytes(data).decode("utf-8")
+def unpack_frame(data: bytes) -> TelemetryFrame:
+    """Unpack a 30-byte binary buffer back into a :class:`TelemetryFrame`."""
+    asset_id, price, timestamp, sequence, flags = struct.unpack(_FRAME_FMT, data[:_FRAME_SIZE])
+    return TelemetryFrame(
+        asset_id=asset_id.rstrip(b"\x00"),
+        price=price,
+        timestamp=timestamp,
+        sequence=sequence,
+        flags=flags,
+    )
 
-# Example usage (to be removed or adapted by the caller):
-# payload = {"asset": "BTC", "price": 12345.67, "timestamp": datetime.utcnow()}
-# encoded = encode_to_bytes(payload)
-# send_to_queue(encoded)
+
+def pack_frames(frames: list[TelemetryFrame]) -> bytes:
+    """Pack a batch of frames into a single contiguous byte array."""
+    return b"".join(pack_frame(f) for f in frames)
+
+
+def unpack_frames(data: bytes) -> list[TelemetryFrame]:
+    """Unpack a contiguous byte array produced by :func:`pack_frames`."""
+    return [
+        unpack_frame(data[i: i + _FRAME_SIZE])
+        for i in range(0, len(data), _FRAME_SIZE)
+        if len(data) - i >= _FRAME_SIZE
+    ]
+
+
+__all__ = [
+    "TelemetryFrame",
+    "pack_frame",
+    "unpack_frame",
+    "pack_frames",
+    "unpack_frames",
+    "FRAME_SIZE",
+]
+
+FRAME_SIZE = _FRAME_SIZE
