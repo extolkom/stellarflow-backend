@@ -141,8 +141,17 @@ export class SignatureValidationService {
     return {
       valid: true,
       canExecute,
-      message: canExecute ? "Consensus reached" : `Need ${updatedConsensus.requiredSignatures - updatedConsensus.collectedSignatures} more`,
-      pendingSignatures: updatedConsensus.pendingSignatures.map(sig => ({ ...sig, userAgent: sig.userAgent || undefined })),
+      message: canExecute
+        ? "Consensus reached - action can be executed"
+        : `Signature added. Need ${updatedConsensus.requiredSignatures - updatedConsensus.collectedSignatures} more signatures`,
+      pendingSignatures: updatedConsensus.pendingSignatures.map((sig: any) => ({
+        adminPublicKey: sig.adminPublicKey,
+        adminName: sig.adminName,
+        adminRole: sig.adminRole,
+        signature: sig.signature,
+        ipAddress: sig.ipAddress,
+        userAgent: sig.userAgent || undefined,
+      })),
       missingSignatures: Math.max(0, updatedConsensus.requiredSignatures - updatedConsensus.collectedSignatures),
     };
   }

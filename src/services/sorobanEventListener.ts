@@ -7,6 +7,7 @@ import stellarProvider from "../lib/stellarProvider";
 import dotenv from "dotenv";
 import { signer } from "../signer";
 import { logger } from "../utils/logger";
+import { parseBase64ToPositiveNumber } from "../serialization/helpers.js";
 
 dotenv.config();
 
