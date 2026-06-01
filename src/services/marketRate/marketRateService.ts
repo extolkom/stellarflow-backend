@@ -23,6 +23,11 @@ import axios from "axios";
 import { createFetcherLogger } from "../../utils/logger";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout";
 import { checkCrossPairConsistency } from "../../logic/crossPairArbitrageDetection";
+import {
+  BackpressureManager,
+  PacketPriority,
+  IngestionPacket,
+} from "../../queue/backpressure";
 
 dotenv.config();
 
@@ -44,7 +49,8 @@ export class MarketRateService {
     reviewId: number;
   }> = [];
   private batchTimeout: any = null;
-  private readonly crossPairLogger = createFetcherLogger('CrossPairArbitrage');
+  private readonly crossPairLogger = createFetcherLogger("CrossPairArbitrage");
+  private backpressureManager: BackpressureManager;
 
   private get CACHE_DURATION_MS() {
     return appConfig.cacheDurationMs;
@@ -73,6 +79,19 @@ export class MarketRateService {
     }
 
     this.initializeFetchers();
+
+    // Initialize backpressure manager with default config
+    this.backpressureManager = new BackpressureManager({
+      maxCapacity: 1000,
+      dropThreshold: 0.9,
+      slowDownThreshold: 0.7,
+      slowDownDelay: 100,
+      enableMetrics: true,
+    });
+
+    console.info(
+      "[MarketRateService] Backpressure manager initialized with max capacity 1000",
+    );
   }
 
   private initializeFetchers(): void {
@@ -136,11 +155,35 @@ export class MarketRateService {
         };
       }
 
+      // Apply backpressure check before fetching
+      const packet: IngestionPacket = {
+        priority: PacketPriority.STANDARD,
+        data: { currency: normalizedCurrency, action: "fetch_rate" },
+        timestamp: Date.now(),
+      };
+
+      const enqueued = await this.backpressureManager.enqueue(packet);
+      if (!enqueued) {
+        console.warn(
+          `[MarketRateService] Rate fetch for ${normalizedCurrency} dropped due to backpressure`,
+        );
+        return {
+          success: false,
+          error: `Rate fetch for ${normalizedCurrency} dropped due to backpressure`,
+        };
+      }
+
       let rate: MarketRate;
 
       try {
         rate = await fetcher.fetchRate();
+
+        // Dequeue the packet after successful fetch
+        this.backpressureManager.tryDequeue();
       } catch (fetchError) {
+        // Dequeue the packet even on error to prevent queue buildup
+        this.backpressureManager.tryDequeue();
+
         try {
           const providerName =
             fetcher && typeof (fetcher as any).constructor === "function"
@@ -237,7 +280,7 @@ export class MarketRateService {
       }
 
       // Cross-pair arbitrage detection (NGN only)
-      if (normalizedCurrency === 'NGN') {
+      if (normalizedCurrency === "NGN") {
         void this.runCrossPairCheck(rate.rate);
       }
 
@@ -695,6 +738,20 @@ export class MarketRateService {
     return status;
   }
 
+  /**
+   * Get backpressure metrics for monitoring queue health
+   */
+  getBackpressureMetrics() {
+    return this.backpressureManager.getMetrics();
+  }
+
+  /**
+   * Reset backpressure metrics (useful for testing)
+   */
+  resetBackpressureMetrics() {
+    this.backpressureManager.resetMetrics();
+  }
+
   private async requestRemoteSignaturesAsync(
     multiSigPriceId: number,
     _memoId: string,
@@ -732,19 +789,23 @@ export class MarketRateService {
   private async runCrossPairCheck(ngnXlmRate: number): Promise<void> {
     try {
       const response = await axios.get(
-        'https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=usd',
+        "https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=usd",
         {
           timeout: OUTGOING_HTTP_TIMEOUT_MS,
-          headers: { 'User-Agent': 'StellarFlow-Oracle/1.0' },
+          headers: { "User-Agent": "StellarFlow-Oracle/1.0" },
         },
       );
       const xlmUsd: unknown = response.data?.stellar?.usd;
-      if (typeof xlmUsd !== 'number' || xlmUsd <= 0) return;
+      if (typeof xlmUsd !== "number" || xlmUsd <= 0) return;
 
       // Derive NGN/USD reference from the same CoinGecko data
       const ngnUsdReference = ngnXlmRate / xlmUsd;
 
-      const result = checkCrossPairConsistency(ngnXlmRate, xlmUsd, ngnUsdReference);
+      const result = checkCrossPairConsistency(
+        ngnXlmRate,
+        xlmUsd,
+        ngnUsdReference,
+      );
 
       if (result.flagged) {
         this.crossPairLogger.warn(
@@ -758,15 +819,18 @@ export class MarketRateService {
           },
         );
       } else {
-        this.crossPairLogger.debug('✅ Cross-pair consistency check passed for NGN', {
-          ngnXlmRate,
-          xlmUsdRate: xlmUsd,
-          impliedRate: result.impliedRate,
-          deviationPercent: result.deviationPercent,
-        });
+        this.crossPairLogger.debug(
+          "✅ Cross-pair consistency check passed for NGN",
+          {
+            ngnXlmRate,
+            xlmUsdRate: xlmUsd,
+            impliedRate: result.impliedRate,
+            deviationPercent: result.deviationPercent,
+          },
+        );
       }
     } catch (error) {
-      this.crossPairLogger.warn('Cross-pair check failed, skipping', {
+      this.crossPairLogger.warn("Cross-pair check failed, skipping", {
         error: error instanceof Error ? error.message : error,
       });
     }
