@@ -13,6 +13,7 @@
     "module": "ESNext",
     "target": "ESNext",
     "moduleResolution": "node",
+    "ignoreDeprecations": "6.0",
     "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
     "types": ["node"],
