@@ -102,9 +102,14 @@ export class MiddleValuePriceService {
     const middleValue = this.calculateMiddleValue(rates);
 
     // Use the most recent timestamp from successful responses
+    const firstResult = successfulResults[0];
+    if (!firstResult) {
+      throw new Error("No successful price sources available for middle value calculation");
+    }
+
     const mostRecentTimestamp = successfulResults.reduce(
       (latest, result) => (result.timestamp > latest ? result.timestamp : latest),
-      successfulResults[0].timestamp,
+      firstResult.timestamp,
     );
 
     this.logger.info(`Calculated middle value price for ${currency}`, {
@@ -142,7 +147,7 @@ export class MiddleValuePriceService {
     
     if (sorted.length % 2 === 1) {
       // Odd number: return the middle element
-      return sorted[middle];
+      return sorted[middle] ?? 0;
     } else {
       // Even number: return average of two middle elements
       const mid1 = sorted[middle - 1];

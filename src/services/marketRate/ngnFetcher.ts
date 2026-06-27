@@ -306,7 +306,7 @@ export class NGNRateFetcher implements MarketRateFetcher {
       this.logger.fetcherError(
         error,
         "All price sources failed - no rates obtained",
-        { attemptedSources: 3, pricesLength: prices.length }
+        { attemptedSources: 3, pricesLength: prices.length },
       );
       throw error;
     }
