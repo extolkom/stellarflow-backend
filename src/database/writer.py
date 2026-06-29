@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Database writers for telemetry persistence.
-============================================
 
 * **RelationalWriter** (Issue #579) – PostgreSQL bulk insert with buffered
   batching via ``psycopg2.extras.execute_values``.  Rows are flushed when
