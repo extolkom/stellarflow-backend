@@ -1,21 +1,12 @@
-import axios from 'axios';
+import axios from "axios";
 
-import { USE_MOCKS }
-  from '../config/env';
+import { USE_MOCKS } from "../../config/env";
 
-import {
-  mockPurchaseAirtime,
-} from '../mocks/mockVtpass';
+import { mockPurchaseAirtime } from "../../mocks/mockVtpass";
 
-export async function purchaseAirtime(
-  phone: string,
-  amount: number,
-) {
+export async function purchaseAirtime(phone: string, amount: number) {
   if (USE_MOCKS) {
-    return mockPurchaseAirtime(
-      phone,
-      amount,
-    );
+    return mockPurchaseAirtime(phone, amount);
   }
 
   return axios.post(
@@ -26,9 +17,7 @@ export async function purchaseAirtime(
     },
     {
       headers: {
-        Authorization:
-          process.env
-            .VTPASS_API_KEY!,
+        Authorization: process.env.VTPASS_API_KEY!,
       },
     },
   );

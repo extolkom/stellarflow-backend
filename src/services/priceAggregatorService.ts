@@ -277,9 +277,6 @@ export class PriceAggregatorService {
     const close = rates[rates.length - 1];
     if (open === undefined || close === undefined) return null;
 
-    const open = rates[0] ?? 0;
-    const close = rates[rates.length - 1] ?? 0;
-
     return {
       open: rates[0]!,
       high: Math.max(...rates),

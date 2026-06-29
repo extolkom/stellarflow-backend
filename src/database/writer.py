@@ -222,3 +222,128 @@ class PartitionedTelemetryWriter:
         """Return the set of partition table names created by this writer."""
         with self._lock:
             return set(self._known_partitions)
+
+
+# ---------------------------------------------------------------------------
+# BatchedWriter — psycopg2 bulk-insert via execute_values (issue #462)
+# ---------------------------------------------------------------------------
+
+import time
+try:
+    import psycopg2
+    import psycopg2.extras
+    _PSYCOPG2_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _PSYCOPG2_AVAILABLE = False
+
+
+class BatchedWriter:
+    """Transactional buffer that groups rows into batches of *batch_size*
+    (default 50) and auto-flushes every *flush_interval_ms* milliseconds
+    (default 1000 ms) using :func:`psycopg2.extras.execute_values`.
+
+    Parameters
+    ----------
+    connection:
+        An open ``psycopg2`` connection (``autocommit`` may be on or off;
+        the writer uses an explicit transaction per flush).
+    table:
+        Target table name.
+    columns:
+        Ordered list of column names that map to each row tuple.
+    batch_size:
+        Flush when the buffer reaches this many rows (default: 50).
+    flush_interval_ms:
+        Maximum milliseconds between flushes (default: 1000).
+    """
+
+    BATCH_SIZE = 50
+    FLUSH_INTERVAL_MS = 1000
+
+    def __init__(
+        self,
+        connection: "psycopg2.extensions.connection",
+        table: str,
+        columns: list,
+        batch_size: int = BATCH_SIZE,
+        flush_interval_ms: int = FLUSH_INTERVAL_MS,
+    ) -> None:
+        if not _PSYCOPG2_AVAILABLE:
+            raise RuntimeError("psycopg2 is required for BatchedWriter")
+        self._conn = connection
+        self._table = table
+        self._columns = columns
+        self._batch_size = batch_size
+        self._flush_interval = flush_interval_ms / 1000.0
+        self._buffer: list = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._last_flush = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="BatchedWriter-Flusher"
+        )
+        self._thread.start()
+        logger.debug(
+            "BatchedWriter started: table=%s batch_size=%d interval_ms=%d",
+            table, batch_size, flush_interval_ms,
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def write(self, row: tuple) -> None:
+        """Buffer a single row tuple and flush if the batch is full."""
+        with self._lock:
+            self._buffer.append(row)
+            should_flush = len(self._buffer) >= self._batch_size
+        if should_flush:
+            self._flush()
+
+    def flush(self) -> None:
+        """Manually flush all buffered rows immediately."""
+        self._flush()
+
+    def shutdown(self) -> None:
+        """Stop the background timer and flush remaining rows."""
+        self._stop.set()
+        self._thread.join()
+        self._flush()
+        logger.info("BatchedWriter shutdown: table=%s", self._table)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._flush_interval):
+            try:
+                self._flush()
+            except Exception:
+                logger.exception("BatchedWriter: error during timed flush")
+
+    def _flush(self) -> None:
+        with self._lock:
+            if not self._buffer:
+                return
+            batch = self._buffer[:]
+            self._buffer.clear()
+
+        col_clause = ", ".join(self._columns)
+        sql = f"INSERT INTO {self._table} ({col_clause}) VALUES %s"
+        try:
+            with self._conn.cursor() as cur:
+                self._conn.autocommit = False
+                psycopg2.extras.execute_values(cur, sql, batch)
+                self._conn.commit()
+            logger.debug(
+                "BatchedWriter flushed %d rows to %s", len(batch), self._table
+            )
+        except Exception:
+            self._conn.rollback()
+            with self._lock:
+                self._buffer = batch + self._buffer
+            logger.exception(
+                "BatchedWriter: flush failed, %d rows re-queued", len(batch)
+            )
+            raise
