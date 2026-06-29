@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import logging
-import queue
 import threading
 import time
 from dataclasses import dataclass, field
+from multiprocessing import shared_memory
+from queue import Queue, Full, Empty
+import struct
 from typing import Callable, Optional
 import logging
-from multiprocessing import shared_memory
-import struct
 
 
 logger = logging.getLogger("Utils.SharedMemory")
@@ -63,7 +63,7 @@ class _PoolState:
 
 
 def _worker(
-    work_queue: queue.Queue,
+    work_queue: Queue,
     stop_event: threading.Event,
     state: _PoolState,
     lock: threading.Lock,
@@ -76,7 +76,7 @@ def _worker(
     while not stop_event.is_set():
         try:
             task: Callable = work_queue.get(timeout=_WORKER_TIMEOUT)
-        except queue.Empty:
+        except Empty:
             continue
 
         try:
@@ -97,7 +97,7 @@ def _worker(
 
 
 def _supervisor(
-    work_queue: queue.Queue,
+    work_queue: Queue,
     threads: list[threading.Thread],
     stop_event: threading.Event,
     state: _PoolState,
@@ -192,7 +192,7 @@ class DynamicThreadingPool:
         self._max_workers = max_workers
         self._supervisor_interval = supervisor_interval
 
-        self._work_queue: queue.Queue = queue.Queue()
+        self._work_queue: Queue = Queue()
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._state = _PoolState(worker_count=min_workers)
@@ -309,7 +309,7 @@ class DynamicThreadingPool:
 
 
 def _worker_with_sentinel(
-    work_queue: queue.Queue,
+    work_queue: Queue,
     stop_event: threading.Event,
     state: _PoolState,
     lock: threading.Lock,
@@ -322,7 +322,7 @@ def _worker_with_sentinel(
     while not stop_event.is_set():
         try:
             task = work_queue.get(timeout=_WORKER_TIMEOUT)
-        except queue.Empty:
+        except Empty:
             continue
 
         # Scale-down sentinel — exit gracefully.
