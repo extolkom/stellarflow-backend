@@ -1,8 +1,13 @@
 import asyncio
 import logging
+import os
+import threading
 import time
-from typing import Dict, List, Optional, Any
+from collections import defaultdict
+from typing import Dict, List, Optional, Set, Any
+
 import aiohttp
+import requests
 
 logger = logging.getLogger("Network.RPCSup")
 
@@ -114,6 +119,190 @@ class PredictiveRPCSupervisor:
                 return
 
         logger.error("CRITICAL FAILURE: Comprehensive Horizon node matrix completely unreachable. No healthy nodes found.")
+
+
+class NonceWindow:
+    """Sliding window nonce tracker for Stellar transaction sequencing.
+
+    Each account maintains a window of in-flight nonces. The base sequence
+    advances as nonces are acknowledged, freeing slots for new acquisitions.
+
+    Thread-safe: all public methods are protected by a per-window lock.
+
+    Parameters
+    ----------
+    window_size:
+        Maximum number of concurrent in-flight nonces per account.
+    """
+
+    DEFAULT_WINDOW_SIZE: int = 64
+
+    def __init__(self, window_size: int = DEFAULT_WINDOW_SIZE) -> None:
+        if window_size < 1:
+            raise ValueError("window_size must be >= 1")
+        self._window_size = window_size
+        self._lock = threading.Lock()
+        self._base: Dict[str, int] = {}
+        self._issued: Dict[str, Set[int]] = defaultdict(set)
+        self._max_issued: Dict[str, int] = {}
+
+    @property
+    def window_size(self) -> int:
+        return self._window_size
+
+    def acquire(self, account: str, seed: Optional[int] = None) -> int:
+        """Acquire the next available nonce for *account*.
+
+        Parameters
+        ----------
+        account:
+            Stellar public key address.
+        seed:
+            If provided, seeds the window base to this value on first use.
+
+        Returns
+        -------
+        int
+            The nonce to use for the next transaction.
+
+        Raises
+        ------
+        ValueError
+            If the window has not been seeded and *seed* is not provided.
+        RuntimeError
+            If all window slots are in flight.
+        """
+        with self._lock:
+            if account not in self._base:
+                if seed is None:
+                    raise ValueError(f"NonceWindow for {account!r} is unseeded — no seed supplied")
+                self._base[account] = seed
+                self._max_issued[account] = seed - 1
+
+            in_flight = len(self._issued[account])
+            if in_flight >= self._window_size:
+                raise RuntimeError(f"Nonce window for {account!r} is exhausted")
+
+            base = self._base[account]
+            nonce = base + in_flight
+            self._issued[account].add(nonce)
+            self._max_issued[account] = max(self._max_issued[account], nonce)
+            return nonce
+
+    def acknowledge(self, account: str, nonce: int) -> None:
+        """Acknowledge completion of a nonce, potentially sliding the window base.
+
+        The base slides forward past any previously-issued nonces that are no
+        longer in flight.
+
+        Parameters
+        ----------
+        account:
+            Stellar public key address.
+        nonce:
+            The nonce that completed.
+        """
+        with self._lock:
+            if account not in self._base:
+                return
+
+            self._issued[account].discard(nonce)
+
+            base = self._base[account]
+            max_issued = self._max_issued[account]
+            while base <= max_issued and base not in self._issued[account]:
+                base += 1
+            self._base[account] = base
+
+    def available_slots(self, account: str) -> int:
+        """Return the number of available nonce slots for *account*.
+
+        Returns 0 if the window has not been seeded.
+        """
+        with self._lock:
+            if account not in self._base:
+                return 0
+            base = self._base[account]
+            max_issued = self._max_issued[account]
+            span = max_issued - base + 1
+            return max(0, self._window_size - span)
+
+    def sync(self, account: str, base: int) -> None:
+        """Reset the window to a specific base value.
+
+        Unlike :meth:`sync_nonce`, this sets the base directly without
+        adjustment. Used for testing and manual reset scenarios.
+
+        Parameters
+        ----------
+        account:
+            Stellar public key address.
+        base:
+            The base sequence to use.
+        """
+        with self._lock:
+            self._base[account] = base
+            self._issued[account] = set()
+            self._max_issued[account] = base - 1
+
+    def invalidate(self, account: Optional[str] = None) -> None:
+        """Invalidate nonce state.
+
+        If *account* is provided, only that account's window is cleared.
+        If *account* is ``None``, all accounts are cleared.
+
+        Parameters
+        ----------
+        account:
+            Optional specific account to invalidate.
+        """
+        with self._lock:
+            if account is None:
+                self._base.clear()
+                self._issued.clear()
+                self._max_issued.clear()
+            else:
+                self._base.pop(account, None)
+                self._issued.pop(account, None)
+                self._max_issued.pop(account, None)
+
+
+class NonceTracker:
+    """Convenience wrapper around :class:`NonceWindow` with a default singleton."""
+
+    def __init__(self, window_size: int = NonceWindow.DEFAULT_WINDOW_SIZE) -> None:
+        self._window = NonceWindow(window_size=window_size)
+
+    def acquire(self, account: str, seed: Optional[int] = None) -> int:
+        return self._window.acquire(account, seed=seed)
+
+    def get_next_nonce(self, account: str, seed: Optional[int] = None) -> int:
+        """Alias for :meth:`Acquire` to match the TxManager interface."""
+        return self._window.acquire(account, seed=seed)
+
+    def acknowledge(self, account: str, nonce: int) -> None:
+        self._window.acknowledge(account, nonce)
+
+    def available_slots(self, account: str) -> int:
+        return self._window.available_slots(account)
+
+    def sync(self, account: str, base: int) -> None:
+        self._window.sync(account, base)
+
+    def sync_nonce(self, account: str, base: int) -> None:
+        """Sync with ledger-confirmed nonce.
+
+        The *base* is the last confirmed nonce from the ledger. The next
+        nonce issued will be ``base + 1``.
+        """
+        self._window.sync(account, base + 1)
+
+    def invalidate(self, account: Optional[str] = None) -> None:
+        self._window.invalidate(account)
+
+
+nonce_tracker = NonceTracker()
+nonce_window = NonceWindow()
 
 
 class RPCNodeFailoverSupervisor:
