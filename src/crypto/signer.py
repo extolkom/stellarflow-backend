@@ -112,11 +112,6 @@ import ctypes.util
 import hashlib
 import logging
 import os
-import platform
-import secrets
-import sys
-import threading
-import time
 from types import TracebackType
 from typing import Optional, Type
 
@@ -150,107 +145,15 @@ class SecurityAuditLogger:
     Audit logs should be persisted to a secure, tamper-evident log service.
     """
 
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._operations = []
-
-    def log_key_imported(self, key_id: str, key_size: int) -> None:
-        """Record when a private key is imported into secure storage."""
-        with self._lock:
-            entry = {
-                "timestamp": time.time(),
-                "event": "KEY_IMPORTED",
-                "key_id": key_id,
-                "key_size_bytes": key_size,
-                "pid": os.getpid(),
-            }
-            self._operations.append(entry)
-            audit_logger.info("Key imported: id=%s size=%d", key_id, key_size)
-
-    def log_signing_operation(self, key_id: str, tx_hash_size: int) -> None:
-        """Record a signing operation."""
-        with self._lock:
-            entry = {
-                "timestamp": time.time(),
-                "event": "SIGNING_OPERATION",
-                "key_id": key_id,
-                "tx_hash_size": tx_hash_size,
-                "pid": os.getpid(),
-            }
-            self._operations.append(entry)
-            audit_logger.info("Signing operation: key_id=%s hash_size=%d", key_id, tx_hash_size)
-
-    def log_key_revoked(self, key_id: str, reason: str = "normal") -> None:
-        """Record when a key is revoked and wiped."""
-        with self._lock:
-            entry = {
-                "timestamp": time.time(),
-                "event": "KEY_REVOKED",
-                "key_id": key_id,
-                "reason": reason,
-                "pid": os.getpid(),
-            }
-            self._operations.append(entry)
-            audit_logger.info("Key revoked: id=%s reason=%s", key_id, reason)
-
-    def log_memory_cleanup(
-        self, obj_type: str, buffer_size: int, wipe_method: str = "ctypes.memset"
-    ) -> None:
-        """Record a memory cleanup event."""
-        with self._lock:
-            entry = {
-                "timestamp": time.time(),
-                "event": "MEMORY_CLEANUP",
-                "object_type": obj_type,
-                "buffer_size": buffer_size,
-                "wipe_method": wipe_method,
-                "pid": os.getpid(),
-            }
-            self._operations.append(entry)
-
-    def log_exception(self, obj_type: str, exception_type: str) -> None:
-        """Record when an exception occurs during cleanup."""
-        with self._lock:
-            entry = {
-                "timestamp": time.time(),
-                "event": "EXCEPTION",
-                "object_type": obj_type,
-                "exception_type": exception_type,
-                "pid": os.getpid(),
-            }
-            self._operations.append(entry)
-            audit_logger.warning("Exception in %s: %s", obj_type, exception_type)
-
-    def get_audit_trail(self) -> list:
-        """Return a copy of the audit trail (for testing/analysis)."""
-        with self._lock:
-            return list(self._operations)
+__all__ = ["SecureKeyHandle", "SecureSessionCredentials", "SigningError"]
 
 
-# Module-level singleton audit logger
-audit_log = SecurityAuditLogger()
-
-# =========================================================================
-# INTERNAL HELPERS - ZERO-WIPE AND MEMORY LOCKING
-# =========================================================================
-
-
-def _zero_wipe(buf: bytearray, audit_details: Optional[dict] = None) -> None:
-    """Overwrite *buf* in-place with zeros.
-
-    Uses ``ctypes.memset`` to write directly into the underlying C buffer,
-    resisting CPython optimisations that could theoretically elide a pure-
-    Python zero loop.  A redundant Python-level pass follows as a belt-and-
-    suspenders measure and to satisfy static analysers that check buffer state.
-
-    Args:
-        buf: The bytearray to zero.
-        audit_details: Optional dict with audit information (object_type, etc).
-    """
+def _zero_wipe(buf: bytearray) -> None:
+    """Overwrite *buf* in-place with zeros."""
     if len(buf) == 0:
         return
+
     try:
-        # Write via ctypes to resist compiler / interpreter elision.
         addr = ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
         ctypes.memset(addr, 0, len(buf))
         
@@ -261,34 +164,35 @@ def _zero_wipe(buf: bytearray, audit_details: Optional[dict] = None) -> None:
                 wipe_method="ctypes.memset"
             )
     finally:
-        # Belt-and-suspenders: also zero through the bytearray view itself so
-        # the object's Python-level state reflects the wipe even if ctypes
-        # raises (e.g. on an interpreter build that restricts buffer access).
         for i in range(len(buf)):
             buf[i] = 0
 
 
-def _wipe_bytes_view(view: bytes) -> None:
-    """Best-effort wipe of an immutable bytes object via ctypes.
-
-    ``bytes`` objects are immutable at the Python level, so this uses a ctypes
-    cast to reach the underlying C buffer directly.  This is inherently racy on
-    a multi-threaded interpreter (another thread may have obtained the same
-    interned object) but is still worth doing on a best-effort basis to reduce
-    the in-memory lifetime of key material.
-
-    This function **must not raise** — it is called from ``finally`` blocks.
+def _lock_memory(buf: bytearray) -> None:
     """
-    if not view:
-        return
-    try:
-        buf = (ctypes.c_char * len(view)).from_buffer_copy(view)
-        # Wipe our local copy.  The original immutable bytes object in the
-        # interpreter heap is unaffected; this is best-effort only.
-        ctypes.memset(ctypes.addressof(buf), 0, len(view))
-    except Exception:  # noqa: BLE001
-        pass  # Never raise from a wipe helper.
+    Best-effort memory lock.
 
+    Prevents pages containing private-key material from being swapped to disk.
+    Uses mlock on Unix-like systems and VirtualLock on Windows.
+    """
+    if len(buf) == 0:
+        return
+
+    try:
+        addr = ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
+        length = ctypes.c_size_t(len(buf))
+
+        if os.name == "nt":
+            kernel32 = ctypes.windll.kernel32
+            kernel32.VirtualLock(ctypes.c_void_p(addr), length)
+        else:
+            libc = ctypes.CDLL(None)
+            if hasattr(libc, "mlock"):
+                libc.mlock(ctypes.c_void_p(addr), length)
+    except Exception:  # noqa: BLE001
+        # Memory locking may fail because of OS limits or permissions.
+        # This hardening is best-effort and must not break signing.
+        pass
 
 # =========================================================================
 # MEMORY-LOCKING HELPERS (mlock / VirtualLock)
@@ -439,178 +343,64 @@ def _munlock_buffer(buf: bytearray) -> None:
 # EXCEPTIONS
 # =========================================================================
 
+def _unlock_memory(buf: bytearray) -> None:
+    """Best-effort unlock for previously locked key memory."""
+    if len(buf) == 0:
+        return
+
+    try:
+        addr = ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
+        length = ctypes.c_size_t(len(buf))
+
+        if os.name == "nt":
+            kernel32 = ctypes.windll.kernel32
+            kernel32.VirtualUnlock(ctypes.c_void_p(addr), length)
+        else:
+            libc = ctypes.CDLL(None)
+            if hasattr(libc, "munlock"):
+                libc.munlock(ctypes.c_void_p(addr), length)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _wipe_bytes_view(view: bytes) -> None:
+    """Best-effort wipe of a temporary bytes copy."""
+    if not view:
+        return
+
+    try:
+        buf = (ctypes.c_char * len(view)).from_buffer_copy(view)
+        ctypes.memset(ctypes.addressof(buf), 0, len(view))
+    except Exception:  # noqa: BLE001
+        pass
+
 
 class SigningError(Exception):
-    """Raised when a signing operation fails or the handle has already been closed.
-
-    Error messages deliberately omit key material, hash values, and signatures.
-    """
-
-
-class MemorySecurityError(Exception):
-    """Raised when a memory security operation fails.
-    
-    This is a critical error that should never occur in normal operation.
-    """
-
-
-# =========================================================================
-# PUBLIC API - SECURE VARIABLE WRAPPER (GENERIC)
-# =========================================================================
-
-
-class SecureVariableWrapper:
-    """Context manager that securely holds any sensitive variable (generic).
-
-    Similar to SecureKeyHandle but without signing capability. Useful for:
-    - Passwords
-    - API keys / tokens
-    - Database credentials
-    - Session secrets
-    - Any sensitive data that needs zero-wiping
-
-    The variable is copied into an internal ``bytearray`` on construction.
-    On ``__exit__`` — normal *or* exceptional — the buffer is zero-wiped
-    **before** any reference is released.
-
-    A ``__del__`` finaliser acts as a last-resort safety net.
-
-    Args:
-        data: Raw bytes/bytearray of the sensitive data.
-        label: Human-readable label for audit logging (e.g. "api_key", "password").
-
-    Raises:
-        ValueError: If *data* is empty.
-        SigningError: If :meth:`get` is called outside the ``with`` block.
-
-    Example::
-
-        password = b"super_secret_password"
-        with SecureVariableWrapper(password, label="database_password") as wrapper:
-            pwd = wrapper.get()
-            # use password ...
-        # Buffer zero-wiped here; wrapper is no longer usable.
-    """
-
-    __slots__ = ("_buf", "_active", "_wiped", "_label", "_locked")
-
-    def __init__(self, data: bytes, label: str = "sensitive_data") -> None:
-        if not data:
-            raise ValueError("data must be non-empty bytes.")
-        self._buf: bytearray = bytearray(data)
-        self._active: bool = False
-        self._wiped: bool = False
-        self._label: str = label
-        # Optionally lock memory pages to prevent swap-out
-        self._locked: bool = _mlock_buffer(self._buf)
-
-    def __enter__(self) -> "SecureVariableWrapper":
-        self._active = True
-        logger.debug("[SecureVariableWrapper] Scope opened for: %s", self._label)
-        audit_log.log_key_imported(self._label, len(self._buf))
-        return self
-
-    def __exit__(
-        self,
-        exc_type: Optional[Type[BaseException]],
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[TracebackType],
-    ) -> bool:
-        self._active = False
-        self._do_wipe()
-        return False
-
-    def __del__(self) -> None:
-        try:
-            self._do_wipe()
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _do_wipe(self) -> None:
-        """Idempotent zero-wipe and page-unlock."""
-        if self._wiped:
-            return
-        self._wiped = True
-        _zero_wipe(
-            self._buf,
-            audit_details={"object_type": "SecureVariableWrapper", "label": self._label}
-        )
-        if self._locked:
-            _munlock_buffer(self._buf)
-            self._locked = False
-        logger.debug("[SecureVariableWrapper] Scope closed and wiped: %s", self._label)
-        audit_log.log_key_revoked(self._label, reason="scope_exit")
-
-    def get(self) -> bytes:
-        """Return a ``bytes`` copy of the stored data.
-
-        Returns:
-            A ``bytes`` copy (caller's responsibility to manage).
-
-        Raises:
-            SigningError: If called outside the ``with`` block.
-        """
-        if not self._active:
-            raise SigningError(
-                f"SecureVariableWrapper.get() for '{self._label}' called outside "
-                "an active scope. Use 'with SecureVariableWrapper(...) as wrapper:'."
-            )
-        if self._wiped:
-            raise SigningError(
-                f"SecureVariableWrapper.get() for '{self._label}' called after "
-                "the buffer has been wiped."
-            )
-        return bytes(self._buf)
-
-
-# =========================================================================
-# PUBLIC API - SECURE KEY HANDLE (SIGNING)
-# =========================================================================
+    """Raised when signing fails or the key handle is no longer usable."""
 
 
 class SecureKeyHandle:
-    """Context manager that holds a private key for exactly one signing scope.
+    """
+    Context manager that keeps private-key material isolated.
 
-    The key is copied into an internal ``bytearray`` on construction.  On
-    ``__exit__`` the buffer is zero-wiped **regardless of whether an exception
-    occurred**, and any further call to :meth:`sign` raises
-    :class:`SigningError`.
-
-    A ``__del__`` finaliser acts as a last-resort safety net: if the caller
-    fails to use the ``with`` statement the buffer is still wiped on garbage
-    collection.
-
-    Args:
-        raw_key: Raw private-key bytes (32 bytes for Ed25519 / Stellar).
-        key_id: Optional identifier for audit logging.
-
-    Raises:
-        ValueError:   If *raw_key* is empty.
-        SigningError: If :meth:`sign` is called outside the ``with`` block.
-
-    Example::
-
-        with SecureKeyHandle(secret_bytes, key_id="signing_key_1") as handle:
-            sig = handle.sign(tx_hash)
-        # Buffer zero-wiped here; handle is inert.
+    The raw key is copied into a mutable bytearray, memory-locked on a
+    best-effort basis, and wiped when the signing scope closes.
     """
 
-    __slots__ = ("_buf", "_active", "_wiped", "_locked", "_key_id", "_sign_count")
+    __slots__ = ("__dict__", "_buf", "_active", "_wiped", "_locked")
 
     def __init__(self, raw_key: bytes, key_id: str = "default_key") -> None:
         if not raw_key:
             raise ValueError("raw_key must be non-empty bytes.")
         self._buf: bytearray = bytearray(raw_key)
+        _lock_memory(self._buf)
+
         self._active: bool = False
         self._wiped: bool = False
         self._key_id: str = key_id
         self._sign_count: int = 0
         # Immediately pin the buffer's pages to physical RAM
         self._locked: bool = _mlock_buffer(self._buf)
-
-    # ------------------------------------------------------------------
-    # Context-manager protocol
-    # ------------------------------------------------------------------
 
     def __enter__(self) -> "SecureKeyHandle":
         self._active = True
@@ -626,70 +416,41 @@ class SecureKeyHandle:
     ) -> bool:
         self._active = False
         self._do_wipe()
-        # Do not suppress exceptions — always re-raise.
         return False
 
     def __del__(self) -> None:
-        """Last-resort safety net: wipe the buffer on garbage collection."""
         try:
             self._do_wipe()
         except Exception:  # noqa: BLE001
             pass
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _do_wipe(self) -> None:
-        """Idempotent zero-wipe and page-unlock of the internal buffer."""
+        """Idempotently wipe and unlock the internal key buffer."""
         if self._wiped:
             return
-        self._wiped = True
-        _zero_wipe(
-            self._buf,
-            audit_details={"object_type": "SecureKeyHandle", "key_id": self._key_id}
-        )
-        if self._locked:
-            _munlock_buffer(self._buf)
-            self._locked = False
-        logger.debug(
-            "[SecureKeyHandle] Signing scope closed for %s — key wiped, %d operations logged.",
-            self._key_id,
-            self._sign_count
-        )
-        audit_log.log_key_revoked(self._key_id, reason="scope_exit")
 
-    # ------------------------------------------------------------------
-    # Signing
-    # ------------------------------------------------------------------
+        self._wiped = True
+
+        try:
+            _zero_wipe(self._buf)
+        finally:
+            _unlock_memory(self._buf)
+
+        logger.debug("[SecureKeyHandle] Signing scope closed — key wiped.")
 
     def sign(self, tx_hash: bytes) -> bytes:
-        """Sign *tx_hash* with the held private key.
-
-        Both the ``stellar_sdk`` and ``PyNaCl`` paths isolate the key material
-        into a temporary ``bytes`` view that is wiped immediately after the
-        library call returns (or raises), via a ``finally`` block.
-
-        Args:
-            tx_hash: The 32-byte transaction hash to sign.
-
-        Returns:
-            64-byte raw Ed25519 signature as an immutable ``bytes`` object.
-
-        Raises:
-            SigningError: If called outside the ``with`` block or after the
-                         scope has been exited.
-            ValueError:  If *tx_hash* is not exactly 32 bytes.
-        """
+        """Sign a 32-byte transaction hash."""
         if not self._active:
             raise SigningError(
                 "SecureKeyHandle.sign() called outside an active signing scope. "
                 "Use 'with SecureKeyHandle(...) as handle:' and call sign() inside."
             )
+
         if self._wiped:
             raise SigningError(
                 "SecureKeyHandle.sign() called after the handle has been wiped."
             )
+
         if len(tx_hash) != 32:
             raise ValueError(f"tx_hash must be exactly 32 bytes, got {len(tx_hash)}.")
 
@@ -698,31 +459,19 @@ class SecureKeyHandle:
         return self._sign_internal(tx_hash)
 
     def _sign_internal(self, tx_hash: bytes) -> bytes:
-        """Perform the actual signing.  Called only from :meth:`sign`."""
-        # Build a fresh bytes copy of the key material.  This copy is
-        # deliberately limited in scope and wiped in the finally block below.
         key_bytes: bytes = bytes(self._buf)
+
         try:
-            stellar_unavailable = False
             try:
                 return self._try_stellar_sdk(key_bytes, tx_hash)
             except ImportError:
-                stellar_unavailable = True
-
-            # Only reach here if stellar_sdk is not installed.
-            if stellar_unavailable:
                 return self._try_pynacl(key_bytes, tx_hash)
-
-            # Should never be reached.
-            raise SigningError("Signing failed: no backend available.")  # pragma: no cover
         finally:
-            # Wipe the transient key copy regardless of success or failure.
             _wipe_bytes_view(key_bytes)
             del key_bytes
 
     @staticmethod
     def _try_stellar_sdk(key_bytes: bytes, tx_hash: bytes) -> bytes:
-        """Attempt signing via ``stellar_sdk.Keypair``."""
         from stellar_sdk import Keypair  # type: ignore[import]  # noqa: PLC0415
 
         try:
@@ -733,7 +482,6 @@ class SecureKeyHandle:
 
     @staticmethod
     def _try_pynacl(key_bytes: bytes, tx_hash: bytes) -> bytes:
-        """Attempt signing via ``nacl.signing.SigningKey`` (PyNaCl)."""
         try:
             from nacl.signing import SigningKey  # type: ignore[import]  # noqa: PLC0415
         except ImportError:
