@@ -1,4 +1,5 @@
 import { NextFunction, Request, Response } from "express";
+import { sendApiError } from "../lib/apiError.js";
 
 let hasWarnedAboutMissingAdminControls = false;
 
@@ -29,18 +30,12 @@ export const adminMiddleware = (
   const requestAdminKey = getHeaderValue(req.headers["x-admin-key"]);
 
   if (configuredAdminKey && requestAdminKey !== configuredAdminKey) {
-    return res.status(403).json({
-      success: false,
-      error: "Invalid or missing admin API key",
-    });
+    return sendApiError(res, 403, "INVALID_ADMIN_KEY");
   }
 
   const configuredAdminIp = process.env.ADMIN_IP;
   if (configuredAdminIp && !matchesAdminIp(req.ip, configuredAdminIp)) {
-    return res.status(403).json({
-      success: false,
-      error: "Admin access denied for this IP address",
-    });
+    return sendApiError(res, 403, "ADMIN_IP_DENIED");
   }
 
   if (

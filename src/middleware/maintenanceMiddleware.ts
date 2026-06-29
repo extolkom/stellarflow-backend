@@ -1,4 +1,5 @@
-import { Request, Response, NextFunction } from 'express';
+import { Request, Response, NextFunction } from "express";
+import { sendApiError } from "../lib/apiError.js";
 
 // Allowlisted endpoints that should remain accessible during maintenance
 const allowlist = [
@@ -15,10 +16,8 @@ export function maintenanceMiddleware(req: Request, res: Response, next: NextFun
   const isMaintenance = process.env.MAINTENANCE_MODE === 'true';
   // Allow allowlisted endpoints
   if (isMaintenance && !allowlist.includes(req.path)) {
-    return res.status(503).json({
-      message: 'Service is under maintenance. Please try again later.',
-      maintenance: true,
-    });
+    sendApiError(res, 503, "MAINTENANCE_MODE");
+    return;
   }
   next();
 }

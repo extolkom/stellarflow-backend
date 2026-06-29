@@ -1,6 +1,7 @@
 import { rateLimit, type Options } from "express-rate-limit";
 import { RedisStore } from "rate-limit-redis";
 import { Request, Response } from "express";
+import { apiErrorPayload } from "../lib/apiError.js";
 import { getRedisClient } from "../lib/redis";
 import { appConfig } from "../config/configWatcher";
 import prisma from "../lib/prisma";
@@ -132,8 +133,10 @@ function buildRateLimitOptions(): Partial<Options> {
     keyGenerator: (req: Request) => normaliseIp(resolveClientIp(req)),
     handler: (_req: Request, res: Response) => {
       res.status(429).json({
-        success: false,
-        error: `Too many requests. Limit: ${appConfig.rateLimit.maxRequests} per ${Math.round(appConfig.rateLimit.windowMs / 60_000)} minutes.`,
+        ...apiErrorPayload(
+          "RATE_LIMITED",
+          `Too many requests. Limit: ${appConfig.rateLimit.maxRequests} per ${Math.round(appConfig.rateLimit.windowMs / 60_000)} minutes.`,
+        ),
         retryAfter: Math.ceil(appConfig.rateLimit.windowMs / 1000),
       });
     },

@@ -3,15 +3,13 @@ import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout.js";
 import {
   MarketRateFetcher,
   MarketRate,
+  RawApiResponse,
   calculateWeightedAverage,
   filterOutliers,
 } from "./types";
 import { withRetry } from "../../utils/retryUtil.js";
-import {
-  getNGNProviderWeight,
-  type NGNProviderWeightKey,
-} from "../../config/providerWeights.js";
 import { createFetcherLogger } from "../../utils/logger.js";
+import { MedianPriceService } from "./medianPriceService.js";
 
 type CoinGeckoPriceResponse = {
   stellar?: {
@@ -48,7 +46,6 @@ type NGNPriceCandidate = {
   rate: number;
   timestamp: Date;
   source: string;
-  providerKey: NGNProviderWeightKey;
 };
 
 function parseAmount(value: string | undefined): number | null {
@@ -74,6 +71,7 @@ export class NGNRateFetcher implements MarketRateFetcher {
 
   private readonly usdToNgnUrl = "https://open.er-api.com/v6/latest/USD";
   private logger = createFetcherLogger("NGNRate");
+  private medianPriceService = new MedianPriceService();
 
   private vtpassBase(): string {
     return (
@@ -100,6 +98,7 @@ export class NGNRateFetcher implements MarketRateFetcher {
   private async fetchNgnPerUsdFromVtpass(): Promise<{
     ngnPerUsd: number;
     timestamp: Date;
+    rawResponse: VtpassVariationsResponse;
   } | null> {
     const serviceId = process.env.VTPASS_NGN_SERVICE_ID?.trim();
     const variationCode = process.env.VTPASS_NGN_VARIATION_CODE?.trim();
@@ -137,15 +136,27 @@ export class NGNRateFetcher implements MarketRateFetcher {
     const ngnPerUsd = rateFromField ?? amount;
     if (ngnPerUsd == null) return null;
 
-    return { ngnPerUsd, timestamp: new Date() };
+    return {
+      ngnPerUsd,
+      timestamp: new Date(),
+      rawResponse: response.data,
+    };
   }
 
   async fetchRate(): Promise<MarketRate> {
     const prices: NGNPriceCandidate[] = [];
+    const rawResponses: RawApiResponse[] = [];
 
     try {
       const vt = await this.fetchNgnPerUsdFromVtpass();
       if (vt) {
+        rawResponses.push({
+          provider: "VTpass",
+          endpoint: `${this.vtpassBase()}/service-variations`,
+          payload: vt.rawResponse,
+          receivedAt: new Date(),
+        });
+
         const coinGeckoResponse = await withRetry(
           () =>
             axios.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
@@ -156,6 +167,13 @@ export class NGNRateFetcher implements MarketRateFetcher {
             }),
           { maxRetries: 3, retryDelay: 1000 },
         );
+
+        rawResponses.push({
+          provider: "CoinGecko",
+          endpoint: this.coinGeckoUrl,
+          payload: coinGeckoResponse.data,
+          receivedAt: new Date(),
+        });
 
         const usd = coinGeckoResponse.data.stellar?.usd;
         if (typeof usd === "number" && usd > 0) {
@@ -169,12 +187,13 @@ export class NGNRateFetcher implements MarketRateFetcher {
             rate: usd * vt.ngnPerUsd,
             timestamp: ts,
             source: "VTpass variation + CoinGecko (XLM/USD)",
-            providerKey: "vtpassCoinGeckoUsd",
           });
         }
       }
     } catch (error) {
-      this.logger.debug("VTpass + CoinGecko XLM/USD failed", { error: error instanceof Error ? error.message : error });
+      this.logger.debug("VTpass + CoinGecko XLM/USD failed", {
+        error: error instanceof Error ? error.message : error,
+      });
     }
 
     try {
@@ -188,6 +207,13 @@ export class NGNRateFetcher implements MarketRateFetcher {
           }),
         { maxRetries: 3, retryDelay: 1000 },
       );
+
+      rawResponses.push({
+        provider: "CoinGecko",
+        endpoint: this.coinGeckoUrl,
+        payload: coinGeckoResponse.data,
+        receivedAt: new Date(),
+      });
 
       const stellarPrice = coinGeckoResponse.data.stellar;
       if (
@@ -203,11 +229,12 @@ export class NGNRateFetcher implements MarketRateFetcher {
           rate: stellarPrice.ngn,
           timestamp: lastUpdatedAt,
           source: "CoinGecko (direct NGN)",
-          providerKey: "coinGeckoDirectNgn",
         });
       }
     } catch (error) {
-      this.logger.debug("CoinGecko direct NGN failed", { error: error instanceof Error ? error.message : error });
+      this.logger.debug("CoinGecko direct NGN failed", {
+        error: error instanceof Error ? error.message : error,
+      });
     }
 
     try {
@@ -221,6 +248,13 @@ export class NGNRateFetcher implements MarketRateFetcher {
           }),
         { maxRetries: 3, retryDelay: 1000 },
       );
+
+      rawResponses.push({
+        provider: "CoinGecko",
+        endpoint: this.coinGeckoUrl,
+        payload: coinGeckoResponse.data,
+        receivedAt: new Date(),
+      });
 
       const stellarPrice = coinGeckoResponse.data.stellar;
       if (
@@ -238,6 +272,13 @@ export class NGNRateFetcher implements MarketRateFetcher {
             }),
           { maxRetries: 3, retryDelay: 1000 },
         );
+
+        rawResponses.push({
+          provider: "ExchangeRate API",
+          endpoint: this.usdToNgnUrl,
+          payload: fxResponse.data,
+          receivedAt: new Date(),
+        });
 
         const usdToNgn = fxResponse.data.rates?.NGN;
         if (
@@ -257,59 +298,76 @@ export class NGNRateFetcher implements MarketRateFetcher {
             timestamp:
               fxTimestamp > lastUpdatedAt ? fxTimestamp : lastUpdatedAt,
             source: "CoinGecko + ExchangeRate API (USD->NGN)",
-            providerKey: "coinGeckoExchangeRateUsdNgn",
           });
         }
       }
     } catch (error) {
-      this.logger.debug("CoinGecko + ExchangeRate API (NGN) failed", { error: error instanceof Error ? error.message : error });
+      this.logger.debug("CoinGecko + ExchangeRate API (NGN) failed", {
+        error: error instanceof Error ? error.message : error,
+      });
     }
 
     if (prices.length === 0) {
       const error = new Error("All NGN rate sources failed");
       this.logger.fetcherError(
-        error,
         "All price sources failed - no rates obtained",
         { attemptedSources: 3, pricesLength: prices.length }
       );
       throw error;
     }
 
-    const filteredRateValues = filterOutliers(
-      prices.map((p) => p.rate).filter((rate) => rate > 0),
-    );
+    const rateValues = prices
+      .map((price) => price.rate)
+      .filter((rate) => Number.isFinite(rate) && rate > 0);
+    const filteredRateValues = filterOutliers(rateValues);
     const filteredPrices = prices.filter((price) =>
       filteredRateValues.includes(price.rate),
     );
-    const pricesToUse = filteredPrices.length > 0 ? filteredPrices : prices;
+    const pricesToUse = filteredPrices.length >= 3 ? filteredPrices : prices;
 
-    const mostRecentTimestamp = prices.reduce(
+    if (pricesToUse.length < 3) {
+      const error = new Error(
+        `Need at least 3 price sources for median calculation, got ${pricesToUse.length}`,
+      );
+      this.logger.fetcherError(
+        `Need at least 3 price sources for median calculation, got ${pricesToUse.length}`,
+        { attemptedSources: 3, pricesLength: pricesToUse.length }
+      );
+      throw error;
+    }
+
+    const mostRecentTimestamp = pricesToUse.reduce(
       (latest, p) => (p.timestamp > latest ? p.timestamp : latest),
-      prices[0]?.timestamp ?? new Date(),
+      pricesToUse[0]?.timestamp ?? new Date(),
     );
 
-    const weightedRate = calculateWeightedAverage(
-      pricesToUse.map((price) => ({
-        value: price.rate,
-        weight: getNGNProviderWeight(price.providerKey),
-      })),
+    const medianRate = this.medianPriceService.calculateMedian(
+      pricesToUse.map((price) => price.rate),
     );
 
     return {
       currency: "NGN",
-      rate: weightedRate,
+      rate: medianRate,
       timestamp: mostRecentTimestamp,
-      source: `Weighted average of ${pricesToUse.length} sources (outliers filtered)`,
+      source: `Median of ${pricesToUse.length} sources`,
+      rawResponses,
     };
   }
 
   async isHealthy(): Promise<boolean> {
     try {
       const rate = await this.fetchRate();
-      this.logger.info("Health check passed", { rate: rate.rate, source: rate.source });
+      this.logger.info("Health check passed", {
+        rate: rate.rate,
+        source: rate.source,
+      });
       return rate.rate > 0;
     } catch (error) {
-      this.logger.error("Health check failed", undefined, error instanceof Error ? error : new Error(String(error)));
+      this.logger.error(
+        "Health check failed",
+        undefined,
+        error instanceof Error ? error : new Error(String(error)),
+      );
       return false;
     }
   }

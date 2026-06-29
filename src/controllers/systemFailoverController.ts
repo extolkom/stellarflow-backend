@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { sendApiError } from "../lib/apiError.js";
 import { getRegionalHealthService } from "../services/regionalHealthService";
 
 type FailoverRegion = "PRIMARY" | "SECONDARY";
@@ -9,10 +10,7 @@ export class SystemFailoverController {
       const { targetRegion } = req.body as { targetRegion?: FailoverRegion };
 
       if (!targetRegion || (targetRegion !== "PRIMARY" && targetRegion !== "SECONDARY")) {
-        res.status(400).json({
-          success: false,
-          error: "Invalid or missing targetRegion. Expected 'PRIMARY' or 'SECONDARY'.",
-        });
+        sendApiError(res, 400, "BAD_REQUEST", "Invalid or missing targetRegion. Expected 'PRIMARY' or 'SECONDARY'.");
         return;
       }
 
@@ -26,10 +24,7 @@ export class SystemFailoverController {
       });
     } catch (error) {
       console.error("[SystemFailoverController] performFailover failed:", error);
-      res.status(500).json({
-        success: false,
-        error: "Could not perform manual failover",
-      });
+      sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Could not perform manual failover");
     }
   }
 
@@ -45,10 +40,7 @@ export class SystemFailoverController {
       });
     } catch (error) {
       console.error("[SystemFailoverController] resetFailover failed:", error);
-      res.status(500).json({
-        success: false,
-        error: "Could not reset failover override",
-      });
+      sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Could not reset failover override");
     }
   }
 
@@ -63,10 +55,7 @@ export class SystemFailoverController {
       });
     } catch (error) {
       console.error("[SystemFailoverController] getFailoverStatus failed:", error);
-      res.status(500).json({
-        success: false,
-        error: "Could not retrieve failover status",
-      });
+      sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Could not retrieve failover status");
     }
   }
 }

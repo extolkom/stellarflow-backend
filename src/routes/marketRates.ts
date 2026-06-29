@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { sendApiError } from "../lib/apiError.js";
 import { getRate, getAllRates } from "../controllers/marketRatesController";
 import { MarketRateService } from "../services/marketRate";
 import { cacheMiddleware, invalidateCache } from "../cache/CacheMiddleware";
@@ -15,7 +16,8 @@ router.get(
   "/rate/:currency",
   cacheMiddleware({
     ttl: CACHE_CONFIG.ttl.marketRates,
-    keyGenerator: (req) => CACHE_KEYS.marketRates.single(req.params.currency),
+    keyGenerator: (req) =>
+      CACHE_KEYS.marketRates.single(req.params.currency as string),
   }),
   getRate,
 );
@@ -48,21 +50,24 @@ router.get(
           ...(result.errors && { errors: result.errors }),
         });
       } else {
-        res.status(500).json({
-          success: false,
-          error: result.error,
-        });
+        sendApiError(
+          res,
+          500,
+          "INTERNAL_SERVER_ERROR",
+          typeof result.error === "string" ? String(result.error) : undefined,
+        );
       }
     } catch (error) {
       console.error("Error fetching latest prices:", error);
 
-      res.status(500).json({
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to fetch latest prices",
-      });
+      sendApiError(
+        res,
+        500,
+        "INTERNAL_SERVER_ERROR",
+        error instanceof Error
+          ? error.message
+          : "Failed to fetch latest prices",
+      );
     }
   },
 );
@@ -83,13 +88,14 @@ router.get(
         data: reviews,
       });
     } catch (error) {
-      res.status(500).json({
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to fetch pending price reviews",
-      });
+      sendApiError(
+        res,
+        500,
+        "INTERNAL_SERVER_ERROR",
+        error instanceof Error
+          ? error.message
+          : "Failed to fetch pending price reviews",
+      );
     }
   },
 );
@@ -100,12 +106,14 @@ router.post(
   invalidateCache("market-rates:*"),
   async (req, res) => {
     try {
-      const reviewId = Number.parseInt(req.params.id, 10);
+      const reviewId = Number.parseInt(req.params.id as string, 10);
       if (!Number.isFinite(reviewId)) {
-        res.status(400).json({
-          success: false,
-          error: "Review ID must be a valid number",
-        });
+        sendApiError(
+          res,
+          400,
+          "BAD_REQUEST",
+          "Review ID must be a valid number",
+        );
         return;
       }
 
@@ -121,13 +129,16 @@ router.post(
         data: review,
       });
     } catch (error) {
-      res.status(isLockdownError(error) ? error.statusCode : 500).json({
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to approve price review",
-      });
+      const statusCode = isLockdownError(error) ? (error.statusCode as number) : 500;
+      const is403 = statusCode === 403;
+      sendApiError(
+        res,
+        statusCode,
+        isLockdownError(error) ? "LOCKDOWN_ACTIVE" : "INTERNAL_SERVER_ERROR",
+        error instanceof Error
+          ? error.message
+          : "Failed to approve price review",
+      );
     }
   },
 );
@@ -138,12 +149,14 @@ router.post(
   invalidateCache("market-rates:*"),
   async (req, res) => {
     try {
-      const reviewId = Number.parseInt(req.params.id, 10);
+      const reviewId = Number.parseInt(req.params.id as string, 10);
       if (!Number.isFinite(reviewId)) {
-        res.status(400).json({
-          success: false,
-          error: "Review ID must be a valid number",
-        });
+        sendApiError(
+          res,
+          400,
+          "BAD_REQUEST",
+          "Review ID must be a valid number",
+        );
         return;
       }
 
@@ -159,13 +172,14 @@ router.post(
         data: review,
       });
     } catch (error) {
-      res.status(500).json({
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to reject price review",
-      });
+      sendApiError(
+        res,
+        500,
+        "INTERNAL_SERVER_ERROR",
+        error instanceof Error
+          ? error.message
+          : "Failed to reject price review",
+      );
     }
   },
 );
@@ -187,10 +201,18 @@ router.get(
         overallHealthy: Object.values(health).every((status) => status),
       });
     } catch (error) {
-      res.status(500).json({
-        success: false,
-        error: error instanceof Error ? error.message : "Internal server error",
-      });
+      sendApiError(
+        res,
+        500,
+        "INTERNAL_SERVER_ERROR",
+        typeof (error instanceof Error
+          ? error.message
+          : "Internal server error") === "string"
+          ? String(
+              error instanceof Error ? error.message : "Internal server error",
+            )
+          : undefined,
+      );
     }
   },
 );
@@ -211,10 +233,18 @@ router.get(
         data: currencies,
       });
     } catch (error) {
-      res.status(500).json({
-        success: false,
-        error: error instanceof Error ? error.message : "Internal server error",
-      });
+      sendApiError(
+        res,
+        500,
+        "INTERNAL_SERVER_ERROR",
+        typeof (error instanceof Error
+          ? error.message
+          : "Internal server error") === "string"
+          ? String(
+              error instanceof Error ? error.message : "Internal server error",
+            )
+          : undefined,
+      );
     }
   },
 );
@@ -229,10 +259,18 @@ router.get("/cache", (req, res) => {
       data: cacheStatus,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
+    sendApiError(
+      res,
+      500,
+      "INTERNAL_SERVER_ERROR",
+      typeof (error instanceof Error
+        ? error.message
+        : "Internal server error") === "string"
+        ? String(
+            error instanceof Error ? error.message : "Internal server error",
+          )
+        : undefined,
+    );
   }
 });
 
@@ -246,106 +284,19 @@ router.post("/cache/clear", (req, res) => {
       message: "Cache cleared successfully",
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
+    sendApiError(
+      res,
+      500,
+      "INTERNAL_SERVER_ERROR",
+      typeof (error instanceof Error
+        ? error.message
+        : "Internal server error") === "string"
+        ? String(
+            error instanceof Error ? error.message : "Internal server error",
+          )
+        : undefined,
+    );
   }
 });
 
-export default router;
-
-import { Router, Request, Response } from "express";
-import { apiKeyAuth } from "../middleware/apiKeyAuth.middleware";
- 
-const router = Router();
- 
-// Apply scope-aware auth to EVERY route in this file.
-// Remove if individual routes need different treatment.
-router.use(apiKeyAuth());
- 
-// ── GET endpoints — require "read" scope ─────────────────────────
- 
-/**
- * GET /api/v1/market-rate
- * Returns the latest cached market rates.
- */
-router.get("/", (_req: Request, res: Response) => {
-  // req.apiKey is guaranteed here (middleware already validated)
-  res.json({
-    success: true,
-    message: "Latest market rates",
-    rates: [
-      { pair: "NGN/XLM", price: 0.0021, source: "NGNX" },
-      { pair: "KES/XLM", price: 0.0052, source: "KESX" },
-      { pair: "GHS/XLM", price: 0.062,  source: "GHSX" },
-    ],
-  });
-});
- 
-/**
- * GET /api/v1/market-rate/history
- * Returns historical price records.
- */
-router.get("/history", (_req: Request, res: Response) => {
-  res.json({ success: true, message: "Price history", data: [] });
-});
- 
-/**
- * GET /api/v1/market-rate/stats
- * Returns aggregated statistics.
- */
-router.get("/stats", (_req: Request, res: Response) => {
-  res.json({ success: true, message: "Market statistics", data: {} });
-});
- 
-// ── POST endpoints — require "write" scope ───────────────────────
- 
-/**
- * POST /api/v1/market-rate/update
- * Submit a new price update to the oracle pipeline.
- *
- * Body: { pair: string, price: number, source: string }
- */
-router.post("/update", (req: Request, res: Response) => {
-  const { pair, price, source } = req.body ?? {};
- 
-  if (!pair || price == null || !source) {
-    res.status(400).json({
-      success: false,
-      error: { code: "BAD_REQUEST", message: "pair, price, and source are required." },
-    });
-    return;
-  }
- 
-  // TODO: hand off to MarketRateService for sanity check + submission
-  res.status(202).json({
-    success: true,
-    message: "Price update accepted and queued for review.",
-    submittedBy: req.apiKey?.label ?? req.apiKey?.id,
-    payload: { pair, price, source },
-  });
-});
- 
-/**
- * POST /api/v1/market-rate/bulk-update
- * Submit multiple price updates in one call.
- */
-router.post("/bulk-update", (req: Request, res: Response) => {
-  const { updates } = req.body ?? {};
- 
-  if (!Array.isArray(updates) || updates.length === 0) {
-    res.status(400).json({
-      success: false,
-      error: { code: "BAD_REQUEST", message: "updates must be a non-empty array." },
-    });
-    return;
-  }
- 
-  res.status(202).json({
-    success: true,
-    message: `${updates.length} updates accepted for batch processing.`,
-  });
-});
- 
 export default router;

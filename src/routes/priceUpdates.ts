@@ -1,4 +1,5 @@
 import express, { Request, Response } from "express";
+import { sendApiError } from "../lib/apiError.js";
 import { multiSigService, SignaturePayload } from "../services/multiSigService";
 import { isLockdownError } from "../state/appState";
 import {
@@ -47,10 +48,7 @@ router.post(
       });
     } catch (error) {
       console.error("[API] Multi-sig request creation failed:", error);
-      res.status(500).json({
-        success: false,
-        error: String(error),
-      });
+      sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (String(error)) === "string" ? String(String(error)) : undefined);
     }
   },
 );
@@ -78,10 +76,7 @@ router.post(
           : authHeader;
 
         if (token !== authToken) {
-          return res.status(403).json({
-            success: false,
-            error: "Unauthorized - invalid token",
-          });
+          return sendApiError(res, 403, "FORBIDDEN", "Unauthorized - invalid token");
         }
       }
 
@@ -129,11 +124,7 @@ router.post(
         typeof multiSigPriceId !== "string" ||
         !remoteServerUrl
       ) {
-        return res.status(400).json({
-          success: false,
-          error:
-            "Missing multiSigPriceId (in URL) or remoteServerUrl (in body)",
-        });
+        return sendApiError(res, 400, "BAD_REQUEST", "Missing multiSigPriceId (in URL) or remoteServerUrl (in body)");
       }
 
       const result = await multiSigService.requestRemoteSignature(
@@ -142,19 +133,13 @@ router.post(
       );
 
       if (!result.success) {
-        return res.status(400).json({
-          success: false,
-          error: result.error,
-        });
+        return sendApiError(res, 400, "BAD_REQUEST", typeof (result.error) === "string" ? String(result.error) : undefined);
       }
 
       res.json({ success: true });
     } catch (error) {
       console.error("[API] Remote signature request failed:", error);
-      res.status(500).json({
-        success: false,
-        error: String(error),
-      });
+      sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (String(error)) === "string" ? String(String(error)) : undefined);
     }
   },
 );
@@ -170,10 +155,7 @@ router.get(
       const multiSigPriceId = req.params.multiSigPriceId;
 
       if (!multiSigPriceId || typeof multiSigPriceId !== "string") {
-        return res.status(400).json({
-          success: false,
-          error: "Missing multiSigPriceId in URL",
-        });
+        return sendApiError(res, 400, "BAD_REQUEST", "Missing multiSigPriceId in URL");
       }
 
       const multiSigPrice = await multiSigService.getMultiSigPrice(
@@ -206,10 +188,7 @@ router.get(
       });
     } catch (error) {
       console.error("[API] Multi-sig status fetch failed:", error);
-      res.status(500).json({
-        success: false,
-        error: String(error),
-      });
+      sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (String(error)) === "string" ? String(String(error)) : undefined);
     }
   },
 );
@@ -238,10 +217,7 @@ router.get("/multi-sig/pending", async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error("[API] Pending multi-sig fetch failed:", error);
-    res.status(500).json({
-      success: false,
-      error: String(error),
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (String(error)) === "string" ? String(String(error)) : undefined);
   }
 });
 
@@ -257,10 +233,7 @@ router.get(
       const multiSigPriceId = req.params.multiSigPriceId;
 
       if (!multiSigPriceId || typeof multiSigPriceId !== "string") {
-        return res.status(400).json({
-          success: false,
-          error: "Missing multiSigPriceId in URL",
-        });
+        return sendApiError(res, 400, "BAD_REQUEST", "Missing multiSigPriceId in URL");
       }
 
       const multiSigPrice = await multiSigService.getMultiSigPrice(
@@ -300,10 +273,7 @@ router.get(
       });
     } catch (error) {
       console.error("[API] Signature fetch failed:", error);
-      res.status(500).json({
-        success: false,
-        error: String(error),
-      });
+      sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (String(error)) === "string" ? String(String(error)) : undefined);
     }
   },
 );
@@ -341,10 +311,7 @@ router.post(
       res.json({ success: true });
     } catch (error) {
       console.error("[API] Submission recording failed:", error);
-      res.status(500).json({
-        success: false,
-        error: String(error),
-      });
+      sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (String(error)) === "string" ? String(String(error)) : undefined);
     }
   },
 );
@@ -363,10 +330,7 @@ router.get("/multi-sig/signer-info", async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error("[API] Signer info fetch failed:", error);
-    res.status(500).json({
-      success: false,
-      error: String(error),
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (String(error)) === "string" ? String(String(error)) : undefined);
   }
 });
 

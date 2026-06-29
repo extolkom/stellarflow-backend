@@ -3,6 +3,7 @@ import {
   MarketRate,
   FetcherResponse,
   AggregatedFetcherResponse,
+  RawApiResponse,
 } from "./types";
 import { KESRateFetcher } from "./kesFetcher";
 import { GHSRateFetcher } from "./ghsFetcher";
@@ -18,10 +19,21 @@ import { normalizeDateToUTC } from "../../utils/timeUtils";
 import { sanityCheckService } from "../sanityCheckService";
 import { appConfig } from "../../config/configWatcher";
 import { isLockdownEnabled } from "../../state/appState";
+import axios from "axios";
+import { createFetcherLogger } from "../../utils/logger";
+import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout";
+import { checkCrossPairConsistency } from "../../logic/crossPairArbitrageDetection";
+import {
+  BackpressureManager,
+  PacketPriority,
+  IngestionPacket,
+} from "../../queue/backpressure";
 
 dotenv.config();
 
 import { priceReviewService } from "../priceReviewService";
+import { webhookService } from "../webhook";
+import { anomalyDetectionService } from "../anomalyDetection";
 
 export class MarketRateService {
   private fetchers: Map<string, MarketRateFetcher> = new Map();
@@ -37,6 +49,8 @@ export class MarketRateService {
     reviewId: number;
   }> = [];
   private batchTimeout: any = null;
+  private readonly crossPairLogger = createFetcherLogger("CrossPairArbitrage");
+  private backpressureManager: BackpressureManager;
 
   private get CACHE_DURATION_MS() {
     return appConfig.cacheDurationMs;
@@ -65,12 +79,60 @@ export class MarketRateService {
     }
 
     this.initializeFetchers();
+
+    // Initialize backpressure manager with default config
+    this.backpressureManager = new BackpressureManager({
+      maxCapacity: 1000,
+      dropThreshold: 0.9,
+      slowDownThreshold: 0.7,
+      slowDownDelay: 100,
+      enableMetrics: true,
+    });
+
+    console.info(
+      "[MarketRateService] Backpressure manager initialized with max capacity 1000",
+    );
   }
 
   private initializeFetchers(): void {
     this.fetchers.set("KES", new KESRateFetcher());
     this.fetchers.set("GHS", new GHSRateFetcher());
     this.fetchers.set("NGN", new NGNRateFetcher());
+  }
+
+  private serializeRawPayload(payload: unknown): string {
+    try {
+      return JSON.stringify(payload);
+    } catch {
+      return String(payload);
+    }
+  }
+
+  private async persistRawResponses(
+    currency: string,
+    rawResponses?: RawApiResponse[],
+  ): Promise<void> {
+    if (!Array.isArray(rawResponses) || rawResponses.length === 0) {
+      return;
+    }
+
+    const clientAny = prisma as any;
+    if (
+      !clientAny?.rawData ||
+      typeof clientAny.rawData.createMany !== "function"
+    ) {
+      return;
+    }
+
+    await clientAny.rawData.createMany({
+      data: rawResponses.map((rawResponse) => ({
+        currency,
+        provider: rawResponse.provider,
+        endpoint: rawResponse.endpoint ?? null,
+        payload: this.serializeRawPayload(rawResponse.payload),
+        fetchedAt: normalizeDateToUTC(rawResponse.receivedAt),
+      })),
+    });
   }
 
   async getRate(currency: string): Promise<FetcherResponse> {
@@ -93,11 +155,35 @@ export class MarketRateService {
         };
       }
 
+      // Apply backpressure check before fetching
+      const packet: IngestionPacket = {
+        priority: PacketPriority.STANDARD,
+        data: { currency: normalizedCurrency, action: "fetch_rate" },
+        timestamp: Date.now(),
+      };
+
+      const enqueued = await this.backpressureManager.enqueue(packet);
+      if (!enqueued) {
+        console.warn(
+          `[MarketRateService] Rate fetch for ${normalizedCurrency} dropped due to backpressure`,
+        );
+        return {
+          success: false,
+          error: `Rate fetch for ${normalizedCurrency} dropped due to backpressure`,
+        };
+      }
+
       let rate: MarketRate;
 
       try {
         rate = await fetcher.fetchRate();
+
+        // Dequeue the packet after successful fetch
+        this.backpressureManager.tryDequeue();
       } catch (fetchError) {
+        // Dequeue the packet even on error to prevent queue buildup
+        this.backpressureManager.tryDequeue();
+
         try {
           const providerName =
             fetcher && typeof (fetcher as any).constructor === "function"
@@ -135,6 +221,15 @@ export class MarketRateService {
         };
       }
 
+      try {
+        await this.persistRawResponses(normalizedCurrency, rate.rawResponses);
+      } catch (rawDataError) {
+        console.error(
+          "Failed to persist raw provider responses:",
+          rawDataError,
+        );
+      }
+
       const normalizedRate: MarketRate = {
         ...rate,
         timestamp: normalizeDateToUTC(rate.timestamp),
@@ -166,17 +261,29 @@ export class MarketRateService {
       };
 
       // Perform Anomaly Detection
-      const anomalyCheck = await anomalyDetectionService.checkAnomaly(normalizedCurrency, rate.rate);
+      const anomalyCheck = await anomalyDetectionService.checkAnomaly(
+        normalizedCurrency,
+        rate.rate,
+      );
       if (anomalyCheck.isAnomalous) {
-        console.warn(`[MarketRateService] Anomaly detected for ${normalizedCurrency}: Z-Score ${anomalyCheck.zScore.toFixed(2)}σ`);
-        await webhookService.sendPriorityAlert({
+        console.warn(
+          `[MarketRateService] Anomaly detected for ${normalizedCurrency}: Z-Score ${anomalyCheck.zScore.toFixed(2)}σ`,
+        );
+        await webhookService.sendManualReviewNotification({
+          reviewId: 0,
           currency: normalizedCurrency,
           rate: rate.rate,
-          zScore: anomalyCheck.zScore,
-          mean: anomalyCheck.mean,
-          stdDev: anomalyCheck.stdDev,
+          previousRate: anomalyCheck.mean,
+          changePercent: Math.abs(anomalyCheck.zScore * 100),
+          source: rate.source,
           timestamp: rate.timestamp,
+          reason: `Anomaly detected: Z-Score ${anomalyCheck.zScore.toFixed(2)}σ`,
         });
+      }
+
+      // Cross-pair arbitrage detection (NGN only)
+      if (normalizedCurrency === "NGN") {
+        void this.runCrossPairCheck(rate.rate);
       }
 
       if (!reviewAssessment.manualReviewRequired) {
@@ -239,8 +346,7 @@ export class MarketRateService {
 
               enrichedRate.contractSubmissionSkipped = false;
               enrichedRate.pendingMultiSig = true;
-              enrichedRate.multiSigPriceId =
-                signatureRequest.multiSigPriceId;
+              enrichedRate.multiSigPriceId = signatureRequest.multiSigPriceId;
             } else {
               const txHash = await this.stellarService.submitPriceUpdate(
                 normalizedCurrency,
@@ -347,9 +453,31 @@ export class MarketRateService {
 
   async getAllRates(): Promise<FetcherResponse[]> {
     const currencies = Array.from(this.fetchers.keys());
-    const promises = currencies.map((currency) => this.getRate(currency));
+    const settledResults = await Promise.allSettled(
+      currencies.map((currency) => this.getRate(currency)),
+    );
 
-    return Promise.all(promises);
+    return settledResults.map((result, index) => {
+      if (result.status === "fulfilled") {
+        return result.value;
+      }
+
+      const failedCurrency = currencies[index];
+      const errorMessage =
+        result.reason instanceof Error
+          ? result.reason.message
+          : String(result.reason);
+
+      console.error(
+        `[MarketRateService] Isolated failure for ${failedCurrency}: ${errorMessage}`,
+        result.reason,
+      );
+
+      return {
+        success: false,
+        error: `Failed to fetch ${failedCurrency}: ${errorMessage}`,
+      };
+    });
   }
 
   private async flushBatchSubmissions() {
@@ -612,6 +740,20 @@ export class MarketRateService {
     return status;
   }
 
+  /**
+   * Get backpressure metrics for monitoring queue health
+   */
+  getBackpressureMetrics() {
+    return this.backpressureManager.getMetrics();
+  }
+
+  /**
+   * Reset backpressure metrics (useful for testing)
+   */
+  resetBackpressureMetrics() {
+    this.backpressureManager.resetMetrics();
+  }
+
   private async requestRemoteSignaturesAsync(
     multiSigPriceId: number,
     _memoId: string,
@@ -644,5 +786,55 @@ export class MarketRateService {
         );
       }
     });
+  }
+
+  private async runCrossPairCheck(ngnXlmRate: number): Promise<void> {
+    try {
+      const response = await axios.get(
+        "https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=usd",
+        {
+          timeout: OUTGOING_HTTP_TIMEOUT_MS,
+          headers: { "User-Agent": "StellarFlow-Oracle/1.0" },
+        },
+      );
+      const xlmUsd: unknown = response.data?.stellar?.usd;
+      if (typeof xlmUsd !== "number" || xlmUsd <= 0) return;
+
+      // Derive NGN/USD reference from the same CoinGecko data
+      const ngnUsdReference = ngnXlmRate / xlmUsd;
+
+      const result = checkCrossPairConsistency(
+        ngnXlmRate,
+        xlmUsd,
+        ngnUsdReference,
+      );
+
+      if (result.flagged) {
+        this.crossPairLogger.warn(
+          `⚠️ CROSS-PAIR ARBITRAGE DETECTED: NGN deviation ${result.deviationPercent.toFixed(2)}% exceeds threshold`,
+          {
+            ngnXlmRate,
+            xlmUsdRate: xlmUsd,
+            impliedRate: result.impliedRate,
+            directRate: result.directRate,
+            deviationPercent: result.deviationPercent,
+          },
+        );
+      } else {
+        this.crossPairLogger.debug(
+          "✅ Cross-pair consistency check passed for NGN",
+          {
+            ngnXlmRate,
+            xlmUsdRate: xlmUsd,
+            impliedRate: result.impliedRate,
+            deviationPercent: result.deviationPercent,
+          },
+        );
+      }
+    } catch (error) {
+      this.crossPairLogger.warn("Cross-pair check failed, skipping", {
+        error: error instanceof Error ? error.message : error,
+      });
+    }
   }
 }

@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { sendApiError } from "../lib/apiError.js";
 import { MarketRateService } from "../services/marketRate/marketRateService";
 import { DerivedAssetService } from "../services/derivedAssetService";
 
@@ -13,10 +14,7 @@ export const getDerivedRate = async (req: Request, res: Response) => {
     const { base, quote } = req.params;
 
     if (!base || !quote) {
-      return res.status(400).json({
-        success: false,
-        error: "Both base and quote currency codes are required",
-      });
+      return sendApiError(res, 400, "BAD_REQUEST", "Both base and quote currency codes are required");
     }
 
     const result = await derivedAssetService.getDerivedRate(

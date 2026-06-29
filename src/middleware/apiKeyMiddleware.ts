@@ -1,80 +1,7 @@
-import { Request, Response, NextFunction } from "express";
-import prisma from "../lib/prisma";
-
-export const apiKeyMiddleware = async (
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): Promise<void> => {
-  // Short-circuit if already authenticated by a previous middleware instance
-  if (req.relayer) {
-    next();
-    return;
-  }
-
-  const apiKey = req.headers["x-api-key"];
-
-  if (typeof apiKey !== "string" || apiKey.length === 0) {
-    res.status(401).json({
-      success: false,
-      error: "Invalid or missing API key",
-    });
-    return;
-  }
-
-  try {
-    // 1. Try to find an active relayer with this API key
-    const relayer = await prisma.relayer.findFirst({
-      where: {
-        apiKey,
-        isActive: true,
-      },
-    });
-
-    if (relayer) {
-      req.relayer = {
-        id: relayer.id,
-        name: relayer.name,
-        allowedAssets: relayer.allowedAssets,
-        publicKey: relayer.publicKey,
-      };
-      next();
-      return;
-    }
-
-    // 2. Fall back to global API key for backward compatibility
-    const expectedKey = process.env.API_KEY;
-
-    if (!expectedKey) {
-      console.error("Critical: API_KEY not set in environment");
-      res.status(500).json({
-        success: false,
-        error: "Authentication configuration error",
-      });
-      return;
-    }
-
-    if (apiKey === expectedKey) {
-      next();
-      return;
-    }
-
-    res.status(401).json({
-      success: false,
-      error: "Invalid or missing API key",
-    });
-  } catch (error) {
-    console.error("[apiKeyMiddleware] Error during authentication:", error);
-    res.status(500).json({
-      success: false,
-      error: "Authentication check failed",
-    });
-  }
-};
-
 import crypto from "crypto";
 import { Request, Response, NextFunction } from "express";
-import { PrismaClient } from "@prisma/client";
+import prisma from "../lib/prisma";
+import { sendApiError } from "../lib/apiError.js";
 import {
   ApiScope,
   AuthenticatedApiKey,
@@ -83,16 +10,11 @@ import {
 } from "../types/apiKey.types";
 
 // ------------------------------------------------------------------
-// Module-level Prisma singleton — reuse the one from src/lib/prisma
-// if your project already exports it; otherwise import directly.
-// ------------------------------------------------------------------
-const prisma = new PrismaClient();
-
-// ------------------------------------------------------------------
 // Extend Express's Request so downstream handlers can safely access
 // req.apiKey without casting.
 // ------------------------------------------------------------------
 declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
       apiKey?: AuthenticatedApiKey;
@@ -107,19 +29,6 @@ declare global {
 /** SHA-256 hash of the raw key (what we store in the DB) */
 function hashKey(rawKey: string): string {
   return crypto.createHash("sha256").update(rawKey).digest("hex");
-}
-
-/** Unified error shape so API consumers get consistent JSON */
-function sendError(
-  res: Response,
-  status: number,
-  code: string,
-  message: string
-): void {
-  res.status(status).json({
-    success: false,
-    error: { code, message },
-  });
 }
 
 // ------------------------------------------------------------------
@@ -142,18 +51,13 @@ export function apiKeyAuth() {
   return async function (
     req: Request,
     res: Response,
-    next: NextFunction
+    next: NextFunction,
   ): Promise<void> {
     // ── 1. Extract raw key from header ──────────────────────────
     const rawKey = req.headers["x-api-key"];
 
     if (!rawKey || typeof rawKey !== "string" || rawKey.trim() === "") {
-      sendError(
-        res,
-        401,
-        "MISSING_API_KEY",
-        "Request must include a valid X-API-Key header."
-      );
+      sendApiError(res, 401, "MISSING_API_KEY");
       return;
     }
 
@@ -161,11 +65,11 @@ export function apiKeyAuth() {
     const required = requiredScopeForMethod(req.method);
 
     if (required === null) {
-      sendError(
+      sendApiError(
         res,
         405,
         "METHOD_NOT_ALLOWED",
-        `HTTP method "${req.method}" is not supported.`
+        `HTTP method "${req.method}" is not supported.`,
       );
       return;
     }
@@ -182,7 +86,7 @@ export function apiKeyAuth() {
     } | null;
 
     try {
-      apiKeyRecord = await prisma.apiKey.findUnique({
+      apiKeyRecord = (await prisma.apiKey.findUnique({
         where: { key: hashKey(rawKey.trim()) },
         select: {
           id: true,
@@ -193,49 +97,54 @@ export function apiKeyAuth() {
           expiresAt: true,
           lastUsedAt: true,
         },
-      }) as typeof apiKeyRecord;
+      })) as typeof apiKeyRecord;
     } catch (dbError) {
       console.error("[apiKeyAuth] DB lookup failed:", dbError);
-      sendError(
+      sendApiError(
         res,
         503,
         "SERVICE_UNAVAILABLE",
-        "Authentication service temporarily unavailable."
+        "Authentication service temporarily unavailable.",
       );
       return;
     }
 
     // ── 4. Key not found ─────────────────────────────────────────
     if (!apiKeyRecord) {
-      sendError(res, 401, "INVALID_API_KEY", "The provided API key is invalid.");
+      sendApiError(
+        res,
+        401,
+        "INVALID_API_KEY",
+        "The provided API key is invalid.",
+      );
       return;
     }
 
     // ── 5. Key disabled ──────────────────────────────────────────
     if (!apiKeyRecord.isActive) {
-      sendError(res, 403, "API_KEY_INACTIVE", "This API key has been revoked.");
+      sendApiError(res, 403, "API_KEY_INACTIVE");
       return;
     }
 
     // ── 6. Key expired ───────────────────────────────────────────
     if (apiKeyRecord.expiresAt && apiKeyRecord.expiresAt < new Date()) {
-      sendError(
+      sendApiError(
         res,
         403,
         "API_KEY_EXPIRED",
-        `This API key expired on ${apiKeyRecord.expiresAt.toISOString()}.`
+        `This API key expired on ${apiKeyRecord.expiresAt.toISOString()}.`,
       );
       return;
     }
 
     // ── 7. Scope check ───────────────────────────────────────────
     if (!hasScope(apiKeyRecord.scopes as ApiScope[], required)) {
-      sendError(
+      sendApiError(
         res,
         403,
         "INSUFFICIENT_SCOPE",
         `This endpoint requires the "${required}" scope. ` +
-          `Your key has: [${apiKeyRecord.scopes.join(", ") || "none"}].`
+          `Your key has: [${apiKeyRecord.scopes.join(", ") || "none"}].`,
       );
       return;
     }
@@ -256,12 +165,14 @@ export function apiKeyAuth() {
         data: { lastUsedAt: new Date() },
       })
       .catch((err: Error) =>
-        console.warn("[apiKeyAuth] lastUsedAt update failed:", err.message)
+        console.warn("[apiKeyAuth] lastUsedAt update failed:", err.message),
       );
 
     next();
   };
 }
+
+export const apiKeyMiddleware = apiKeyAuth();
 
 // ------------------------------------------------------------------
 // Optional: scope-specific shorthand helpers
@@ -285,16 +196,21 @@ function scopeGuard(scope: ApiScope) {
     const key = _req.apiKey;
 
     if (!key) {
-      sendError(res, 401, "UNAUTHENTICATED", "apiKeyAuth() must run before scopeGuard.");
+      sendApiError(
+        res,
+        401,
+        "UNAUTHENTICATED",
+        "apiKeyAuth() must run before scopeGuard.",
+      );
       return;
     }
 
     if (!hasScope(key.scopes, scope)) {
-      sendError(
+      sendApiError(
         res,
         403,
         "INSUFFICIENT_SCOPE",
-        `This action requires the "${scope}" scope.`
+        `This action requires the "${scope}" scope.`,
       );
       return;
     }

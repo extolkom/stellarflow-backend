@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from "express";
+import { sendApiError } from "../lib/apiError.js";
 import Joi from "joi";
 import { logger } from "../utils/logger";
 import {
@@ -73,10 +74,7 @@ export function createPayloadSanitizer(
         route: req.path,
       });
 
-      res.status(500).json({
-        success: false,
-        error: "Request validation error",
-      });
+      sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Request validation error");
     }
   };
 }
@@ -154,10 +152,7 @@ export function sanitizeMarketRateQuery(
       ip: req.ip,
     });
 
-    res.status(500).json({
-      success: false,
-      error: "Query validation error",
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Query validation error");
   }
 }
 
@@ -273,10 +268,7 @@ export function validatePriceAndCurrency(
         error: err instanceof Error ? err.message : String(err),
       });
 
-      res.status(500).json({
-        success: false,
-        error: "Validation error",
-      });
+      sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Validation error");
     }
   };
 }

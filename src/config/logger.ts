@@ -1,5 +1,6 @@
 import winston from 'winston';
 
+<<<<<<< HEAD
 const {
   combine,
   timestamp,
@@ -21,6 +22,26 @@ const consoleFormat = printf(
     }`;
   },
 );
+=======
+import { HttpLogTransport }
+  from '../transport/httpLogTransport';
+
+const transports = [
+  new winston.transports.Console(),
+];
+
+if (
+  process.env
+    .LOG_STREAM_ENABLED ===
+  'true'
+) {
+  transports.push(
+    new HttpLogTransport({
+      level: 'info',
+    }) as any,
+  );
+}
+>>>>>>> 180fe69792d3498090e107e3cfc89592e9d658ed
 
 export const logger =
   winston.createLogger({

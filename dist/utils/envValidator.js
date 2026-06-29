@@ -3,7 +3,23 @@
  * Prevents the server from crashing mysteriously if a setting is missing.
  */
 export function validateEnv() {
-    const requiredEnvVars = ["DB_URL", "STELLAR_KEY"];
+    const isKms = process.env.SIGNER_BACKEND === "kms";
+    const requiredEnvVars = [
+        "DB_URL",
+        "STELLAR_KEY",
+        "JWT_SECRET",
+        "SESSION_SECRET",
+    ];
+    // If not using KMS, we need either the plaintext or encrypted secret.
+    // Validation of the actual key happens in SecretManager.ts, but we check presence here.
+    if (!isKms) {
+        if (!process.env.STELLAR_SECRET && !process.env.ENCRYPTED_STELLAR_SECRET && !process.env.ORACLE_SECRET_KEY && !process.env.SOROBAN_ADMIN_SECRET) {
+            requiredEnvVars.push("STELLAR_SECRET");
+        }
+        if (process.env.ENCRYPTED_STELLAR_SECRET && !process.env.VAULT_MASTER_KEY) {
+            requiredEnvVars.push("VAULT_MASTER_KEY");
+        }
+    }
     const missingEnvVars = [];
     for (const envVar of requiredEnvVars) {
         if (!process.env[envVar]) {
@@ -20,13 +36,18 @@ export function validateEnv() {
         process.exit(1);
     }
     // Log optional but recommended environment variables
-    const recommendedEnvVars = ["MAX_LATENCY_MS"];
+    const recommendedEnvVars = [
+        "MAX_LATENCY_MS",
+        "REDIS_URL",
+        "TRUST_PROXY",
+        "JWT_EXPIRY_HOURS",
+    ];
     for (const envVar of recommendedEnvVars) {
         if (!process.env[envVar]) {
             console.warn(`⚠️ [OPS] Recommended environment variable not set: ${envVar}`);
         }
         else {
-            console.info(`✅ [OPS] ${envVar} = ${process.env[envVar]}ms`);
+            console.info(`✅ [OPS] ${envVar} = ${process.env[envVar]}`);
         }
     }
 }

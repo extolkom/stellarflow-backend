@@ -2,7 +2,7 @@ import axios from "axios";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../utils/httpTimeout";
 import { withRetry } from "../utils/retryUtil";
 import { createFetcherLogger } from "../utils/logger";
-import { webhookReporter } from "../utils/webhookReporter";
+import { sendPriceAnomalyAlert } from "./notificationService";
 
 interface SanityCheckResult {
   currency: string;
@@ -225,20 +225,14 @@ export class SanityCheckService {
    */
   private async sendAlert(result: SanityCheckResult): Promise<void> {
     try {
-      const message = `🚨 **Price Sanity Check Alert**
-
-**Currency:** ${result.currency}
-**Oracle Price:** ${result.oraclePrice.toFixed(4)}
-**External Price (${result.source}):** ${result.externalPrice.toFixed(4)}
-**Deviation:** ${result.deviationPercent}% (Threshold: ${this.DEVIATION_THRESHOLD}%)
-**Difference:** ${result.deviation.toFixed(4)}
-
-The Oracle price differs significantly from the external source. Please review.`;
-
-      await webhookReporter.sendCriticalAlert(
-        `Price Sanity Check Failed - ${result.currency}: ${message}`,
-        `${result.currency} sanity check`
-      );
+      await sendPriceAnomalyAlert({
+        currency: result.currency,
+        rate: result.oraclePrice,
+        expectedRate: result.externalPrice,
+        deviationPercent: result.deviationPercent,
+        source: result.source,
+        correlationId: `sanity_${result.currency}_${Date.now()}`
+      });
     } catch (error) {
       this.logger.error(
         "Failed to send sanity check alert",

@@ -1,4 +1,5 @@
 import axios from "axios";
+import { sendFailoverEventAlert } from "./notificationService.js";
 
 type FailoverRegion = "PRIMARY" | "SECONDARY";
 
@@ -245,10 +246,27 @@ export class RegionalHealthService {
       return;
     }
 
+    const previousRegion = this.activeRegion;
     this.activeRegion = region;
     console.info(
       `[RegionalHealthService] Active region changed to ${region} (${this.getActiveUrl()}) via ${reason}`,
     );
+
+    // Send failover event alert
+    try {
+      const isAutomatic = reason.includes("automatic");
+      sendFailoverEventAlert({
+        fromRegion: previousRegion,
+        toRegion: region,
+        reason,
+        automatic: isAutomatic,
+        correlationId: `failover_${Date.now()}`
+      }).catch(error => {
+        console.error("[RegionalHealthService] Failed to send failover alert:", error);
+      });
+    } catch (error) {
+      console.error("[RegionalHealthService] Error sending failover alert:", error);
+    }
   }
 }
 

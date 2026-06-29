@@ -10,7 +10,27 @@ promClient.collectDefaultMetrics({
   labels: { app: 'stellarflow-backend' },
 });
 
-// Create a custom histogram for HTTP request durations
+/** * NEW: Ingestion Queue Metrics 
+ * Tracks the current depth of the backpressure queue
+ */
+export const ingestionQueueDepth = new promClient.Gauge({
+  name: "ingestion_queue_depth",
+  help: "Current number of items in the backpressure queue",
+});
+register.registerMetric(ingestionQueueDepth);
+
+/**
+ * NEW: Dropped Packets Counter
+ * Tracks how many packets were dropped due to saturation/backpressure
+ */
+export const droppedPacketsTotal = new promClient.Counter({
+  name: "ingestion_dropped_packets_total",
+  help: "Total number of packets dropped by the backpressure manager",
+  labelNames: ["priority"],
+});
+register.registerMetric(droppedPacketsTotal);
+
+// Custom histogram for HTTP request durations
 export const httpRequestDurationMicroseconds = new promClient.Histogram({
   name: "http_request_duration_seconds",
   help: "Duration of HTTP requests in seconds",
@@ -19,7 +39,7 @@ export const httpRequestDurationMicroseconds = new promClient.Histogram({
 });
 register.registerMetric(httpRequestDurationMicroseconds);
 
-// Create a custom counter for HTTP requests
+// Custom counter for HTTP requests
 export const httpRequestsTotal = new promClient.Counter({
   name: "http_requests_total",
   help: "Total number of HTTP requests",
@@ -42,11 +62,8 @@ export const metricsMiddleware = (
     if (req.route && req.route.path) {
       routeStr = req.baseUrl + req.route.path;
     } else {
-      // Fallback for custom handlers mapped directly on app
       if (
-        req.path === "/health" ||
-        req.path === "/" ||
-        req.path === "/metrics" ||
+        ["/health", "/", "/metrics"].includes(req.path) ||
         req.path.startsWith("/api/v1/docs")
       ) {
         routeStr = req.path;

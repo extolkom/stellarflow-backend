@@ -4,28 +4,61 @@ import {
   TransactionBuilder,
   Transaction,
   Operation,
-  Networks,
   Memo,
   Horizon,
   xdr,
   Account,
 } from "@stellar/stellar-sdk";
 import stellarProvider from "../lib/stellarProvider";
+import {
+  getStellarNetwork,
+  getStellarNetworkPassphrase,
+} from "../lib/stellarNetwork";
 import { sequenceManager } from "./sequence-manager";
 import { assertSigningAllowed } from "../state/appState";
-import { getSecretKey } from "./secretManager";
+import { signer } from "../signer";
+import { logger } from "../utils/logger";
 
 dotenv.config();
 
+interface PendingTimeBoundTransaction {
+  hash: string;
+  publicKey: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+  timer?: ReturnType<typeof setTimeout>;
+  timedOut: boolean;
+}
+
+class LocalTransactionTimeoutError extends Error {
+  readonly code = "LOCAL_TX_TIME_BOUND_EXPIRED";
+  readonly transactionHash: string;
+  readonly publicKey: string;
+
+  constructor(transactionHash: string, publicKey: string) {
+    super(
+      `Transaction ${transactionHash} exceeded local time-bound and was recycled`,
+    );
+    this.name = "LocalTransactionTimeoutError";
+    this.transactionHash = transactionHash;
+    this.publicKey = publicKey;
+  }
+}
+
 export class StellarService {
   private server: Horizon.Server;
-  private network: string;
+  private readonly networkPassphrase: string;
   private readonly MAX_RETRIES = 3;
   private readonly FEE_INCREMENT_PERCENTAGE = 0.5; // 50% increase each retry
   private readonly RETRY_DELAY_MS = 2000; // 2 seconds delay between retries
+  private readonly TRANSACTION_TIME_BOUND_SECONDS = 15;
+  private readonly pendingTimeBoundTransactions = new Map<
+    string,
+    PendingTimeBoundTransaction
+  >();
 
   constructor() {
-    this.network = process.env.STELLAR_NETWORK || "TESTNET";
+    this.networkPassphrase = getStellarNetworkPassphrase();
 
     // Use the shared StellarProvider so all services benefit from the same
     // failover state rather than each managing their own Horizon URL.
@@ -33,11 +66,10 @@ export class StellarService {
   }
 
   /**
-   * Returns a Keypair derived from the currently active secret key.
-   * Called at sign time so key rotations are reflected immediately.
+   * Returns the Stellar public key from the signer.
    */
-  private getKeypair(): Keypair {
-    return Keypair.fromSecret(getSecretKey());
+  private async getPublicKey(): Promise<string> {
+    return signer.getPublicKey();
   }
 
   /**
@@ -65,8 +97,7 @@ export class StellarService {
       (sourceAccount, currentFee) => {
         return new TransactionBuilder(sourceAccount, {
           fee: currentFee.toString(),
-          networkPassphrase:
-            this.network === "PUBLIC" ? Networks.PUBLIC : Networks.TESTNET,
+          networkPassphrase: this.networkPassphrase,
         })
           .addOperation(
             Operation.manageData({
@@ -75,14 +106,22 @@ export class StellarService {
             }),
           )
           .addMemo(Memo.text(memoId))
-          .setTimeout(60)
+          .setTimeout(this.TRANSACTION_TIME_BOUND_SECONDS)
           .build();
       },
       this.MAX_RETRIES,
       baseFee,
     );
 
-    console.info(`✅ Price update for ${currency} confirmed. Hash: ${result.hash}`);
+    const network = getStellarNetwork();
+    const txURL = network === "TESTNET"
+      ? `https://testnet.stellarexpert.org/tx/${result.hash}`
+      : `https://stellarexpert.org/tx/${result.hash}`;
+
+    logger.networkInfo(
+      `✅ Price update for ${currency} confirmed. Hash: ${result.hash} | StellarExpert: ${txURL}`,
+      { hash: result.hash, url: txURL },
+    );
     return result.hash;
   }
 
@@ -104,8 +143,7 @@ export class StellarService {
       (sourceAccount, currentFee) => {
         const builder = new TransactionBuilder(sourceAccount, {
           fee: currentFee.toString(),
-          networkPassphrase:
-            this.network === "PUBLIC" ? Networks.PUBLIC : Networks.TESTNET,
+          networkPassphrase: this.networkPassphrase,
         });
 
         for (const update of updates) {
@@ -117,14 +155,25 @@ export class StellarService {
           );
         }
 
-        return builder.addMemo(Memo.text(memoId)).setTimeout(60).build();
+        return builder
+          .addMemo(Memo.text(memoId))
+          .setTimeout(this.TRANSACTION_TIME_BOUND_SECONDS)
+          .build();
       },
       this.MAX_RETRIES,
       baseFee,
     );
 
     const currencies = updates.map((u) => u.currency).join(", ");
-    console.info(`✅ Batched price update for [${currencies}] confirmed. Hash: ${result.hash}`);
+    const network = getStellarNetwork();
+    const txURL = network === "TESTNET"
+      ? `https://testnet.stellarexpert.org/tx/${result.hash}`
+      : `https://stellarexpert.org/tx/${result.hash}`;
+
+    logger.networkInfo(
+      `✅ Batched price update for [${currencies}] confirmed. Hash: ${result.hash} | StellarExpert: ${txURL}`,
+      { hash: result.hash, url: txURL, currencies },
+    );
     return result.hash;
   }
 
@@ -144,8 +193,7 @@ export class StellarService {
       (sourceAccount, currentFee) => {
         return new TransactionBuilder(sourceAccount, {
           fee: currentFee.toString(),
-          networkPassphrase:
-            this.network === "PUBLIC" ? Networks.PUBLIC : Networks.TESTNET,
+          networkPassphrase: this.networkPassphrase,
         })
           .addOperation(
             Operation.manageData({
@@ -154,7 +202,7 @@ export class StellarService {
             }),
           )
           .addMemo(Memo.text(memoId))
-          .setTimeout(60)
+          .setTimeout(this.TRANSACTION_TIME_BOUND_SECONDS)
           .build();
       },
       signatures,
@@ -162,7 +210,15 @@ export class StellarService {
       baseFee,
     );
 
-    console.info(`✅ Multi-signed price update for ${currency} confirmed. Hash: ${result.hash}`);
+    const network = getStellarNetwork();
+    const txURL = network === "TESTNET"
+      ? `https://testnet.stellarexpert.org/tx/${result.hash}`
+      : `https://stellarexpert.org/tx/${result.hash}`;
+
+    logger.networkInfo(
+      `✅ Multi-signed price update for ${currency} confirmed. Hash: ${result.hash} | StellarExpert: ${txURL}`,
+      { hash: result.hash, url: txURL },
+    );
     return result.hash;
   }
 
@@ -185,38 +241,56 @@ export class StellarService {
         this.server = stellarProvider.getServer();
 
         // Use SequenceManager to avoid collisions and redundant loadAccount calls
-        const nextSequence = await sequenceManager.getNextSequence(
-          this.getKeypair().publicKey()
-        );
+        const publicKey = await this.getPublicKey();
+        const nextSequence = await sequenceManager.getNextSequence(publicKey);
 
-        const sourceAccount = new Account(
-          this.getKeypair().publicKey(),
-          nextSequence
-        );
+        const sourceAccount = new Account(publicKey, nextSequence);
 
         const currentFee = Math.floor(
           baseFee * (1 + this.FEE_INCREMENT_PERCENTAGE * attempt),
         );
 
         const transaction = builderFn(sourceAccount, currentFee);
+        this.assertStrictTimeBounds(transaction);
         await assertSigningAllowed();
-        transaction.sign(this.getKeypair());
+        
+        const txHash = transaction.hash();
+        const signature = await signer.sign(txHash);
+        const kp = Keypair.fromPublicKey(publicKey);
+        
+        transaction.signatures.push(
+          new xdr.DecoratedSignature({
+            hint: kp.signatureHint(),
+            signature: signature,
+          })
+        );
 
-        return await this.server.submitTransaction(transaction);
+        return await this.submitWithTimeoutListener(transaction, publicKey);
       } catch (error: any) {
         const resultCode = error.response?.data?.extras?.result_codes?.transaction;
 
-        if (resultCode === "tx_bad_seq") {
-          console.warn("⚠️ SequenceManager: tx_bad_seq detected. Invalidating sequence and retrying...");
-          sequenceManager.invalidate(this.getKeypair().publicKey());
+        if (resultCode === "tx_bad_seq" || this.isLocalTimeoutError(error)) {
+          logger.warn(
+            "⚠️ SequenceManager: stale or invalid local transaction assignment detected. Invalidating sequence and retrying...",
+          );
+          const publicKey = await this.getPublicKey();
+          await sequenceManager.syncSequence(publicKey);
         }
 
         attempt++;
-        stellarProvider.reportFailure(error);
+        if (!this.isLocalTimeoutError(error)) {
+          stellarProvider.reportFailure(error);
+        }
 
         if (this.isStuckError(error) && attempt <= maxRetries) {
-          console.warn(`⚠️ Transaction stuck or fee too low (Attempt ${attempt}). Bumping fee and retrying...`);
-          await new Promise((resolve) => setTimeout(resolve, this.RETRY_DELAY_MS));
+          logger.warn(
+            `⚠️ Transaction stuck, expired, or fee too low (Attempt ${attempt}). Recycling locally and retrying...`,
+          );
+          if (!this.shouldRecycleImmediately(error)) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, this.RETRY_DELAY_MS),
+            );
+          }
           continue;
         }
 
@@ -245,26 +319,33 @@ export class StellarService {
       try {
         this.server = stellarProvider.getServer();
 
-        const nextSequence = await sequenceManager.getNextSequence(
-          this.getKeypair().publicKey()
-        );
+        const publicKey = await this.getPublicKey();
+        const nextSequence = await sequenceManager.getNextSequence(publicKey);
 
-        const sourceAccount = new Account(
-          this.getKeypair().publicKey(),
-          nextSequence
-        );
+        const sourceAccount = new Account(publicKey, nextSequence);
 
         const currentFee = Math.floor(
           baseFee * (1 + this.FEE_INCREMENT_PERCENTAGE * attempt),
         );
 
         const transaction = builderFn(sourceAccount, currentFee);
+        this.assertStrictTimeBounds(transaction);
 
         await assertSigningAllowed();
-        transaction.sign(this.getKeypair());
+        
+        const txHash = transaction.hash();
+        const signature = await signer.sign(txHash);
+        const kp = Keypair.fromPublicKey(publicKey);
+        
+        transaction.signatures.push(
+          new xdr.DecoratedSignature({
+            hint: kp.signatureHint(),
+            signature: signature,
+          })
+        );
 
         for (const sig of signatures) {
-          if (sig.signerPublicKey === this.getKeypair().publicKey()) continue;
+          if (sig.signerPublicKey === publicKey) continue;
 
           try {
             const signatureBuffer = Buffer.from(sig.signature, "hex");
@@ -277,24 +358,33 @@ export class StellarService {
 
             transaction.signatures.push(decoratedSignature);
           } catch (error) {
-            console.error(`[StellarService] Failed to add signature for ${sig.signerPublicKey}:`, error);
+            logger.error(`[StellarService] Failed to add signature for ${sig.signerPublicKey}:`, { error });
           }
         }
 
-        return await this.server.submitTransaction(transaction);
+        return await this.submitWithTimeoutListener(transaction, publicKey);
       } catch (error: any) {
         const resultCode = error.response?.data?.extras?.result_codes?.transaction;
 
-        if (resultCode === "tx_bad_seq") {
-          console.warn("⚠️ SequenceManager: tx_bad_seq detected in multi-sig. Invalidating sequence...");
-          sequenceManager.invalidate(this.getKeypair().publicKey());
+        if (resultCode === "tx_bad_seq" || this.isLocalTimeoutError(error)) {
+          logger.warn(
+            "⚠️ SequenceManager: stale or invalid multi-sig assignment detected. Invalidating sequence...",
+          );
+          const publicKey = await this.getPublicKey();
+          await sequenceManager.syncSequence(publicKey);
         }
 
         attempt++;
-        stellarProvider.reportFailure(error);
+        if (!this.isLocalTimeoutError(error)) {
+          stellarProvider.reportFailure(error);
+        }
 
         if (this.isStuckError(error) && attempt <= maxRetries) {
-          await new Promise((resolve) => setTimeout(resolve, this.RETRY_DELAY_MS));
+          if (!this.shouldRecycleImmediately(error)) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, this.RETRY_DELAY_MS),
+            );
+          }
           continue;
         }
 
@@ -305,15 +395,113 @@ export class StellarService {
     throw new Error(`Failed to submit multi-signed transaction after ${maxRetries + 1} attempts`);
   }
 
+  private assertStrictTimeBounds(transaction: Transaction): void {
+    const timeBounds = (transaction as any).timeBounds;
+    const maxTime = Number(timeBounds?.maxTime);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    if (
+      !Number.isFinite(maxTime) ||
+      maxTime <= nowSeconds ||
+      maxTime - nowSeconds > this.TRANSACTION_TIME_BOUND_SECONDS
+    ) {
+      throw new Error(
+        `Transaction envelope must include strict time_bounds of ${this.TRANSACTION_TIME_BOUND_SECONDS}s or less`,
+      );
+    }
+  }
+
+  private async submitWithTimeoutListener(
+    transaction: Transaction,
+    publicKey: string,
+  ): Promise<any> {
+    const pending = this.registerPendingTimeBoundTransaction(
+      transaction,
+      publicKey,
+    );
+
+    try {
+      return await Promise.race([
+        this.server.submitTransaction(transaction),
+        new Promise<never>((_, reject) => {
+          pending.timer = setTimeout(() => {
+            const activePending = this.pendingTimeBoundTransactions.get(
+              pending.hash,
+            );
+
+            if (!activePending) {
+              return;
+            }
+
+            activePending.timedOut = true;
+            this.pendingTimeBoundTransactions.delete(pending.hash);
+            logger.warn(
+              `[StellarService] Transaction ${pending.hash} exceeded ${this.TRANSACTION_TIME_BOUND_SECONDS}s time-bound. Recycling local assignment.`,
+            );
+            reject(
+              new LocalTransactionTimeoutError(pending.hash, pending.publicKey),
+            );
+          }, Math.max(pending.expiresAtMs - Date.now(), 0));
+        }),
+      ]);
+    } finally {
+      this.clearPendingTimeBoundTransaction(pending.hash);
+    }
+  }
+
+  private registerPendingTimeBoundTransaction(
+    transaction: Transaction,
+    publicKey: string,
+  ): PendingTimeBoundTransaction {
+    const createdAtMs = Date.now();
+    const hash = transaction.hash().toString("hex");
+    const pending: PendingTimeBoundTransaction = {
+      hash,
+      publicKey,
+      createdAtMs,
+      expiresAtMs:
+        createdAtMs + this.TRANSACTION_TIME_BOUND_SECONDS * 1000,
+      timedOut: false,
+    };
+
+    this.pendingTimeBoundTransactions.set(hash, pending);
+    return pending;
+  }
+
+  private clearPendingTimeBoundTransaction(hash: string): void {
+    const pending = this.pendingTimeBoundTransactions.get(hash);
+
+    if (!pending) {
+      return;
+    }
+
+    if (pending.timer) {
+      clearTimeout(pending.timer);
+    }
+    this.pendingTimeBoundTransactions.delete(hash);
+  }
+
   private isStuckError(error: any): boolean {
     const resultCode = error.response?.data?.extras?.result_codes?.transaction;
     return (
+      this.isLocalTimeoutError(error) ||
       resultCode === "tx_too_late" ||
       resultCode === "tx_insufficient_fee" ||
       resultCode === "tx_bad_seq" ||
       error.message?.includes("timeout") ||
       error.code === "ECONNABORTED"
     );
+  }
+
+  private shouldRecycleImmediately(error: any): boolean {
+    const resultCode = error.response?.data?.extras?.result_codes?.transaction;
+    return this.isLocalTimeoutError(error) || resultCode === "tx_too_late";
+  }
+
+  private isLocalTimeoutError(
+    error: unknown,
+  ): error is LocalTransactionTimeoutError {
+    return error instanceof LocalTransactionTimeoutError;
   }
 
   generateMemoId(currency: string): string {

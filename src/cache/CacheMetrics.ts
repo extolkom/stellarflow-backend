@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { sendApiError } from "../lib/apiError.js";
 import { cacheService } from "./CacheService";
 import { CacheInvalidation } from "./CacheInvalidation";
 import { getRedisClient } from "../lib/redis";
@@ -32,10 +33,7 @@ router.get("/metrics", (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Failed to get metrics",
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Failed to get metrics") === "string" ? String(error instanceof Error ? error.message : "Failed to get metrics") : undefined);
   }
 });
 
@@ -59,10 +57,7 @@ router.post("/clear", async (req, res) => {
       message: "Cache cleared successfully",
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Failed to clear cache",
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Failed to clear cache") === "string" ? String(error instanceof Error ? error.message : "Failed to clear cache") : undefined);
   }
 });
 
@@ -104,10 +99,7 @@ router.get("/health", async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Health check failed",
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Health check failed") === "string" ? String(error instanceof Error ? error.message : "Health check failed") : undefined);
   }
 });
 

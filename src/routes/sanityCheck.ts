@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { sendApiError } from "../lib/apiError.js";
 import { sanityCheckService } from "../services/sanityCheckService";
 import prisma from "../lib/prisma";
 
@@ -51,10 +52,7 @@ router.get("/check/:currency", async (req, res) => {
     );
 
     if (!result) {
-      res.status(500).json({
-        success: false,
-        error: "Unable to fetch external price for comparison",
-      });
+      sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Unable to fetch external price for comparison");
       return;
     }
 
@@ -63,10 +61,7 @@ router.get("/check/:currency", async (req, res) => {
       data: result,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Internal server error") === "string" ? String(error instanceof Error ? error.message : "Internal server error") : undefined);
   }
 });
 
@@ -118,10 +113,7 @@ router.get("/check-all", async (req, res) => {
       data: results,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Internal server error") === "string" ? String(error instanceof Error ? error.message : "Internal server error") : undefined);
   }
 });
 
@@ -149,10 +141,7 @@ router.get("/threshold", (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Internal server error") === "string" ? String(error instanceof Error ? error.message : "Internal server error") : undefined);
   }
 });
 

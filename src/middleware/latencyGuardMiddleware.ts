@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from "express";
+import { sendApiError } from "../lib/apiError.js";
 import prisma from "../lib/prisma";
 import { getMaxLatencyMs } from "../utils/envValidator";
 
@@ -45,8 +46,8 @@ export const latencyValidationMiddleware = async (
         `[LatencyGuard] Invalid timestamp format in relayer payload: ${payloadTimestamp}`,
       );
       await logLatencyViolation(
-        req.relayer.id,
-        req.relayer.name,
+        req.relayer?.id ?? null,
+        req.relayer?.name ?? null,
         "INVALID_TIMESTAMP",
         payloadTimestamp,
         null,
@@ -54,10 +55,7 @@ export const latencyValidationMiddleware = async (
         { error: "Invalid timestamp format" },
       );
       
-      res.status(400).json({
-        success: false,
-        error: "Invalid timestamp format in payload",
-      });
+      sendApiError(res, 400, "BAD_REQUEST", "Invalid timestamp format in payload");
       return;
     }
 
@@ -73,8 +71,8 @@ export const latencyValidationMiddleware = async (
 
       // Log the violation to ComplianceMetadataStore
       await logLatencyViolation(
-        req.relayer.id,
-        req.relayer.name,
+        req.relayer?.id ?? null,
+        req.relayer?.name ?? null,
         "LATENCY_VIOLATION",
         payloadTimestamp,
         latencyDiff,
@@ -110,8 +108,8 @@ export const latencyValidationMiddleware = async (
     
     // Log the error as a violation for auditing
     await logLatencyViolation(
-      req.relayer.id,
-      req.relayer.name,
+      req.relayer?.id ?? null,
+      req.relayer?.name ?? null,
       "VALIDATION_ERROR",
       payloadTimestamp,
       null,
@@ -119,10 +117,7 @@ export const latencyValidationMiddleware = async (
       { error: String(error) },
     );
 
-    res.status(500).json({
-      success: false,
-      error: "Latency validation failed",
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Latency validation failed");
   }
 };
 
@@ -130,8 +125,8 @@ export const latencyValidationMiddleware = async (
  * Logs a latency violation to the ComplianceMetadataStore for auditing.
  */
 async function logLatencyViolation(
-  relayerId: number | undefined,
-  relayerName: string | undefined,
+  relayerId: number | null,
+  relayerName: string | null,
   eventType: string,
   payloadTimestamp: string | null,
   latencyDiffMs: number | null,
@@ -141,8 +136,8 @@ async function logLatencyViolation(
   try {
     await prisma.complianceMetadata.create({
       data: {
-        relayerId: relayerId,
-        relayerName: relayerName,
+        relayerId,
+        relayerName,
         eventType,
         payloadTimestamp: payloadTimestamp ? new Date(payloadTimestamp) : null,
         receivedAt: new Date(),

@@ -4,6 +4,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
 import { Horizon } from "@stellar/stellar-sdk";
+import { getStellarNetwork } from "./lib/stellarNetwork";
 import marketRatesRouter from "./routes/marketRates";
 import historyRouter from "./routes/history";
 import priceUpdatesRouter from "./routes/priceUpdates";
@@ -14,19 +15,32 @@ import { disconnectRedis } from "./lib/redis";
 import { initSocket } from "./lib/socket";
 import { SorobanEventListener } from "./services/sorobanEventListener";
 import { multiSigSubmissionService } from "./services/multiSigSubmissionService";
+import {
+  GasBalanceMonitorService,
+  getGasBalanceMonitorService,
+} from "./services/gasBalanceMonitorService";
+import { sanitizeEnvironmentVariables } from "./config/environment";
 import { validateEnv } from "./utils/envValidator";
 import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
 import { watchConfig } from "./config/configWatcher";
+import { startEnvFileWatcher } from "./config/envFileWatcher";
 import { validateDatabaseSchema } from "./utils/dbValidator";
 import { initializeTracing } from "./config/tracingConfig";
 import { setupAxiosTracing } from "./lib/tracing";
 import { registerTracingShutdownHandlers } from "./utils/shutdownTracing";
+import { providerSecretRotationService } from "./services/providerSecretRotationService";
+import { priceAggregatorService } from "./services/priceAggregatorService";
+import { contractSanityCheckService } from "./services/contractSanityCheckService";
 
 // Load environment variables
 dotenv.config();
+
+// Normalize safe startup environment strings before runtime storage.
+// This helps ensure tokens and asset-like values are canonicalized from mixed case.
+sanitizeEnvironmentVariables();
 
 // Initialize tracing before other services
 initializeTracing();
@@ -81,7 +95,7 @@ if (!dashboardUrl) {
 const PORT = process.env.PORT || 3000;
 
 // Horizon server for health checks
-const stellarNetwork = process.env.STELLAR_NETWORK || "TESTNET";
+const stellarNetwork = getStellarNetwork();
 const horizonUrl =
   stellarNetwork === "PUBLIC"
     ? "https://horizon.stellar.org"
@@ -217,6 +231,7 @@ app.get("/", (req, res) => {
       },
       stats: {
         volume: "/api/v1/stats/volume?date=YYYY-MM-DD",
+        relayers: "/api/stats/relayers",
       },
       history: {
         assetHistory: "/api/v1/history/:asset?range=1d|7d|30d|90d",
@@ -226,9 +241,6 @@ app.get("/", (req, res) => {
         priceChange: "/api/v1/intelligence/price-change/:currency",
         staleCurrencies: "/api/v1/intelligence/stale",
       },
-      stats: {
-        relayers: "/api/stats/relayers",
-      },
     },
   });
 });
@@ -237,10 +249,15 @@ app.get("/", (req, res) => {
 const httpServer = createServer(app);
 initSocket(httpServer);
 let sorobanEventListener: SorobanEventListener | null = null;
+
+// FIX 1: Typed as nullable — constructor is not called at module level,
+// so a missing secret env var won't crash the process before the server starts.
+let gasBalanceMonitorService: GasBalanceMonitorService | null = null;
+
 let isShuttingDown = false;
 let stopEnvFileWatcher: (() => void) | undefined;
 const stopConfigWatcher = watchConfig((cfg) => {
-  sorobanEventListener?.restart(cfg.sorobanPollIntervalMs);
+  sorobanEventListener?.stop();
   multiSigSubmissionService.restart(cfg.multiSigPollIntervalMs);
   hourlyAverageService.restart(cfg.hourlyAverageCheckIntervalMs);
 });
@@ -280,7 +297,11 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
   try {
     sorobanEventListener?.stop();
     multiSigSubmissionService.stop();
+    // FIX 2: Optional chaining — safe to call even if service never started
+    gasBalanceMonitorService?.stop();
     hourlyAverageService.stop();
+    priceAggregatorService.stop();
+    providerSecretRotationService.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -314,7 +335,7 @@ process.once("SIGTERM", () => {
   });
 });
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   console.log(`🌊 StellarFlow Backend running on port ${PORT}`);
   console.log(
     `📊 Market Rates API available at http://localhost:${PORT}/api/market-rates`,
@@ -325,19 +346,56 @@ httpServer.listen(PORT, () => {
   console.log(`🏥 Health check at http://localhost:${PORT}/health`);
   console.log(`🔌 Socket.io ready for dashboard connections`);
 
-  // Start Soroban event listener to track confirmed on-chain prices
-  try {
-    sorobanEventListener = new SorobanEventListener();
-    sorobanEventListener.start().catch((err) => {
-      console.error("Failed to start event listener:", err);
-    });
-    console.log(`👂 Soroban event listener started`);
-  } catch (err) {
-    console.warn(
-      "Event listener not started:",
-      err instanceof Error ? err.message : err,
+  // Perform contract sanity check before starting ingestion loop
+  let contractSanityPassed = true;
+  if (contractSanityCheckService.isConfigured()) {
+    try {
+      const sanityResult = await contractSanityCheckService.performSanityCheck();
+      if (!sanityResult.success) {
+        console.error(
+          `❌ Contract sanity check failed: ${sanityResult.error}`,
+        );
+        console.error(
+          "⛔ Preventing ingestion loop from starting due to contract failure",
+        );
+        contractSanityPassed = false;
+      }
+    } catch (err) {
+      console.error(
+        "❌ Contract sanity check error:",
+        err instanceof Error ? err.message : err,
+      );
+      console.error(
+        "⛔ Preventing ingestion loop from starting due to contract check error",
+      );
+      contractSanityPassed = false;
+    }
+  } else {
+    console.log(
+      "ℹ️ CONTRACT_ID not configured - skipping contract sanity check (ingestion loop will start)",
     );
-    sorobanEventListener = null;
+  }
+
+  // Start Soroban event listener to track confirmed on-chain prices
+  // Only start if contract sanity check passed or if check is not configured
+  if (contractSanityPassed) {
+    try {
+      sorobanEventListener = new SorobanEventListener();
+      sorobanEventListener.start().catch((err) => {
+        console.error("Failed to start event listener:", err);
+      });
+      console.log(`👂 Soroban event listener started`);
+    } catch (err) {
+      console.warn(
+        "Event listener not started:",
+        err instanceof Error ? err.message : err,
+      );
+      sorobanEventListener = null;
+    }
+  } else {
+    console.warn(
+      "⚠️ Soroban event listener NOT started due to failed contract sanity check",
+    );
   }
 
   // Start multi-sig submission service if enabled
@@ -364,6 +422,35 @@ httpServer.listen(PORT, () => {
   } catch (err) {
     console.warn(
       "Hourly average service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Issue #208 – Start OHLC price aggregation worker
+  try {
+    priceAggregatorService.start().catch((err: Error) => {
+      console.error("Failed to start OHLC price aggregator:", err);
+    });
+    console.log(`📈 OHLC price aggregator started (MINUTE / HOUR / DAY)`);
+  } catch (err) {
+    console.warn(
+      "OHLC price aggregator not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // FIX 3: getGasBalanceMonitorService() moved inside the listen callback so
+  // the constructor (and Keypair.fromSecret) only runs after the server is up.
+  // A missing secret env var now warns gracefully instead of crashing the process.
+  try {
+    gasBalanceMonitorService = getGasBalanceMonitorService();
+    gasBalanceMonitorService.start().catch((err: Error) => {
+      console.error("Failed to start gas balance monitor service:", err);
+    });
+    console.log(`⛽ Gas balance monitor service started`);
+  } catch (err) {
+    console.warn(
+      "Gas balance monitor service not started:",
       err instanceof Error ? err.message : err,
     );
   }
